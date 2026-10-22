@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>美股仓位监控 · 币安 TradFi</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg1:#0a0e1a; --bg2:#0d1326; --panel:#111a2e; --panel2:#16213a;
+    --line:#22305a; --txt:#e6e9f2; --sub:#8ea0c6; --blue:#3A7BD5; --blue2:#5B9BE0;
+    --green:#22c55e; --red:#ef4444; --amber:#f5b759;
+  }
+  html,body { height:100%; }
+  body {
+    font-family:"Microsoft YaHei UI","PingFang SC",system-ui,sans-serif;
+    background:linear-gradient(160deg,var(--bg1) 0%,var(--bg2) 60%,#0e1a33 100%);
+    color:var(--txt); min-height:100vh; padding:18px 22px 30px;
+  }
+  body::before {
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+    background-image:
+      radial-gradient(circle at 15% 10%, rgba(59,123,213,.14), transparent 42%),
+      radial-gradient(circle at 85% 90%, rgba(59,123,213,.10), transparent 45%);
+  }
+  header { position:relative; z-index:1; display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  h1 { font-size:22px; letter-spacing:1px; }
+  h1 .grad { background:linear-gradient(90deg,#4d8ef0,#7cc0ff); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .subtitle { font-size:12px; color:var(--sub); margin-top:3px; }
+  .spacer { flex:1; }
+  button {
+    font-family:inherit; font-size:13px; cursor:pointer; border:none; border-radius:8px;
+    padding:9px 18px; color:#fff; background:linear-gradient(135deg,#1b4fa0,#3A7BD5);
+    transition:filter .15s, transform .05s;
+  }
+  button:hover { filter:brightness(1.15); }
+  button:active { transform:translateY(1px); }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--blue2); }
+  button.ghost:hover { background:#14234a; }
+  .pmsg { margin:0 0 10px; font-size:14px; line-height:1.6; min-height:0; }
+  .pmsg.ok { color:#4ade80; }
+  .pmsg.err { color:#f87171; }
+  .btn-open { padding:5px 14px; font-size:13px; border-radius:6px; background:#2563eb; color:#fff; }
+  .btn-open:hover { filter:brightness(1.15); }
+  .btn-open:disabled { background:#334155; color:#94a3b8; cursor:not-allowed; filter:none; }
+  .btn-add { padding:5px 14px; font-size:13px; border-radius:6px; background:#b45309; color:#fff; }
+  .btn-add:hover { filter:brightness(1.15); }
+  .btn-add:disabled { background:#334155; color:#94a3b8; cursor:not-allowed; filter:none; }
+  .acct-select {
+    background:#14234a; color:var(--txt); border:1px solid var(--line);
+    border-radius:8px; padding:8px 12px; font-size:13px; cursor:pointer;
+  }
+  .acct-select:focus { outline:none; border-color:var(--blue); }
+  #status {
+    font-size:12px; color:var(--sub); background:rgba(10,14,26,.7); border:1px solid var(--line);
+    border-radius:10px; padding:8px 14px; max-width:560px; line-height:1.5;
+  }
+  nav.tabs { position:relative; z-index:1; display:flex; gap:10px; margin:18px 0 12px; flex-wrap:wrap; }
+  nav.tabs button {
+    background:transparent; border:1px solid var(--line); color:var(--sub); padding:9px 20px; border-radius:10px;
+  }
+  nav.tabs button.active {
+    background:linear-gradient(135deg,#1b4fa0,#3A7BD5); color:#fff; border-color:transparent;
+    box-shadow:0 4px 14px rgba(59,123,213,.35);
+  }
+  main { position:relative; z-index:1; }
+  section.panel { display:none; }
+  section.panel.active { display:block; }
+  .page-head { display:flex; align-items:center; gap:12px; margin-bottom:8px; }
+  .page-head h2 { font-size:16px; }
+  .page-head .hint { font-size:12px; color:var(--sub); }
+  .page-head .count { font-size:12px; color:var(--blue2); margin-left:auto; }
+  .tbl-wrap {
+    overflow:auto; border:1px solid var(--line); border-radius:12px; background:rgba(12,17,32,.75);
+    box-shadow:0 6px 24px rgba(0,0,0,.35);
+  }
+  table { width:100%; border-collapse:collapse; font-size:13px; min-width:720px; }
+  thead th {
+    position:sticky; top:0; z-index:2; background:#0e1730; color:var(--blue2);
+    text-align:left; font-weight:600; padding:11px 14px; border-bottom:1px solid var(--line);
+    white-space:nowrap;
+  }
+  tbody td { padding:10px 14px; border-bottom:1px solid rgba(34,48,90,.45); white-space:nowrap; }
+  tbody tr:nth-child(even) { background:rgba(22,33,58,.55); }
+  tbody tr:hover { background:rgba(37,56,100,.55); }
+  /* 页2锁仓监控：同一币种多空行收紧，不同币种间加大间隔 */
+  tbody tr.grp-a { background:rgba(58,123,213,.08); }
+  tbody tr.grp-a:hover { background:rgba(58,123,213,.18); }
+  tbody tr.grp-row td { padding:5px 14px; }
+  tbody tr.grp-gap { background:transparent; }
+  tbody tr.grp-gap:hover { background:transparent; }
+  tbody tr.grp-gap td { padding:0; height:20px; border:none; background:#c0392b; }
+  .sym { font-weight:700; letter-spacing:.3px; }
+  .side-long { color:var(--green); font-weight:700; }
+  .side-short { color:var(--red); font-weight:700; }
+  .num { font-family:Consolas,"Courier New",monospace; }
+  .roi-pos { color:var(--green); font-weight:700; }
+  .roi-neg { color:var(--red); font-weight:700; }
+  .roi-zero { color:var(--amber); }
+  .pnl-pos { color:var(--green); }
+  .pnl-neg { color:var(--red); }
+  .acct { color:var(--sub); font-size:12px; }
+  .empty { text-align:center; color:var(--sub); padding:42px 0; font-size:14px; }
+  .empty .big { font-size:16px; color:var(--blue2); margin-bottom:6px; }
+  .loading-dots::after { content:""; display:inline-block; width:10px; animation:dots 1.2s infinite steps(4); }
+  @keyframes dots { 0%{content:""} 25%{content:"·"} 50%{content:"··"} 75%{content:"···"} }
+
+  /* 密钥弹窗 */
+  .overlay { display:none; position:fixed; inset:0; z-index:10; background:rgba(5,8,16,.72); }
+  .overlay.show { display:flex; align-items:center; justify-content:center; }
+  .modal {
+    width:min(620px,94vw); max-height:86vh; overflow:auto;
+    background:linear-gradient(160deg,#101a30,#0c1428); border:1px solid #2a3c6e;
+    border-radius:16px; padding:22px 24px; box-shadow:0 20px 60px rgba(0,0,0,.6);
+  }
+  .modal h3 { font-size:16px; margin-bottom:4px; }
+  .modal .m-sub { font-size:12px; color:var(--sub); margin-bottom:14px; }
+  .key-row { display:grid; grid-template-columns:96px 1fr 1fr 30px; gap:8px; margin-bottom:10px; align-items:center; }
+  .key-row input {
+    width:100%; background:#0a1020; border:1px solid var(--line); border-radius:8px;
+    color:var(--txt); padding:8px 10px; font-size:12px; font-family:Consolas,monospace; outline:none;
+  }
+  .key-row input:focus { border-color:var(--blue); }
+  .key-row .del { color:var(--red); background:none; border:none; cursor:pointer; font-size:16px; padding:6px; }
+  .key-row .del:hover { filter:brightness(1.4); }
+  .modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; }
+  .modal-actions .note { font-size:11px; color:var(--sub); margin-right:auto; padding-top:8px; }
+  .err { color:var(--red); font-size:12px; margin-top:8px; min-height:16px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>美股仓位监控 <span class="grad">· 币安 TradFi 永续</span></h1>
+    <div class="subtitle" id="subtitle">监视 215 个美股/ETF 交易对 · 密钥仅保存在本浏览器</div>
+  </div>
+  <select id="acctSelect" class="acct-select" title="切换账户：开仓使用该账户，并按该账户查看"></select>
+  <div class="spacer"></div>
+  <div id="status">未加载。请先「添加账户」。</div>
+  <button class="ghost" id="btnKeys">⚙ 添加账户</button>
+  <button id="btnRefresh">⟳ 刷新数据</button>
+</header>
+
+<nav class="tabs">
+  <button class="active" data-page="p1">页 1 · 盈利榜（回报率 ≥ 100%）</button>
+  <button data-page="p2">页 2 · 双亏监控（多空都亏超 -100%）</button>
+  <button data-page="p3">页 3 · 开仓（缺方向交易对）</button>
+</nav>
+
+<main>
+  <section class="panel active" id="p1">
+    <div class="page-head">
+      <h2>高回报率持仓</h2>
+      <span class="hint">投资回报率 ≥ 100% 的持仓（多单/空单都统计）</span>
+      <span class="count" id="p1count"></span>
+    </div>
+    <div class="pmsg" id="p1msg"></div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>交易对名称</th><th>账户</th><th>方向</th><th>持仓数量(USDT)</th><th>未实现盈亏</th><th>投资回报率</th><th>加仓操作</th>
+        </tr></thead>
+        <tbody id="p1body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="p2">
+    <div class="page-head">
+      <h2>同币双亏监控</h2>
+      <span class="hint">同一币种同时持有多单和空单，且两边回报率都亏超 -100%（如 -110% 和 -135%）才显示；有一边没亏超（如 -90%）就不显示</span>
+      <span class="count" id="p2count"></span>
+    </div>
+    <div class="pmsg" id="p2msg"></div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>交易对名称</th><th>账户</th><th>方向</th><th>持仓数量(USDT)</th><th>未实现盈亏</th><th>投资回报率</th><th>加仓操作</th>
+        </tr></thead>
+        <tbody id="p2body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="p3">
+    <div class="page-head">
+      <h2>缺方向交易对（开仓）</h2>
+      <span class="hint">按缺失的多空方向列出：缺多单 → 显示「多」；缺空单 → 显示「空」；无任何持仓 → 同时显示「多」「空」两行。点「开仓」：按系统最小开仓额 + 1 USDT 市价开仓（用标题旁下拉选择的账户），成功后按钮禁用防重复</span>
+      <span class="count" id="p3count"></span>
+    </div>
+    <div class="pmsg" id="p3msg"></div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>交易对名称</th><th>方向</th><th>开仓操作</th>
+        </tr></thead>
+        <tbody id="p3body"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <h3>设置 API 密钥</h3>
+    <div class="m-sub">每个账户一行：API Key + Secret。密钥只保存在本浏览器的 localStorage，不会上传任何地方；可随时清除。</div>
+    <div id="keyRows"></div>
+    <button class="ghost" id="btnAddKey">+ 添加账户</button>
+    <div class="err" id="keyErr"></div>
+    <div class="modal-actions">
+      <span class="note">保存后点「刷新数据」开始加载</span>
+      <button class="ghost" id="btnCancel">取消</button>
+      <button id="btnSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ================= 纯 JS SHA-256 / HMAC-SHA256（file:// 也能签名） ================= */
+function _concatBytes(a,b){const o=new Uint8Array(a.length+b.length);o.set(a);o.set(b,a.length);return o;}
+function _sha256Bytes(dataBytes){
+  const K=new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+  const H=new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  const R=(x,n)=>(x>>>n)|(x<<(32-n));
+  const total=(((dataBytes.length+9+63)>>>6)*64)>>>0;
+  const by=new Uint8Array(total); by.set(dataBytes); by[dataBytes.length]=0x80;
+  const bitLen=dataBytes.length*8; const dv=new DataView(by.buffer);
+  dv.setUint32(by.length-4,bitLen>>>0); dv.setUint32(by.length-8,Math.floor(bitLen/0x100000000));
+  const w=new Uint32Array(total/4);
+  for(let i=0;i<w.length;i++) w[i]=dv.getUint32(i*4);
+  const W=new Uint32Array(64);
+  for(let block=0;block<w.length;block+=16){
+    for(let t=0;t<16;t++) W[t]=w[block+t];
+    for(let t=16;t<64;t++){
+      const s0=R(W[t-15],7)^R(W[t-15],18)^(W[t-15]>>>3);
+      const s1=R(W[t-2],17)^R(W[t-2],19)^(W[t-2]>>>10);
+      W[t]=(W[t-16]+s0+W[t-7]+s1)>>>0;
+    }
+    let a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+    for(let t=0;t<64;t++){
+      const S1=R(e,6)^R(e,11)^R(e,25),ch=(e&f)^(~e&g),t1=(h+S1+ch+K[t]+W[t])>>>0;
+      const S0=R(a,2)^R(a,13)^R(a,22),maj=(a&b)^(a&c)^(b&c),t2=(S0+maj)>>>0;
+      h=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;
+    }
+    H[0]=(H[0]+a)>>>0;H[1]=(H[1]+b)>>>0;H[2]=(H[2]+c)>>>0;H[3]=(H[3]+d)>>>0;
+    H[4]=(H[4]+e)>>>0;H[5]=(H[5]+f)>>>0;H[6]=(H[6]+g)>>>0;H[7]=(H[7]+h)>>>0;
+  }
+  const out=new Uint8Array(32),ov=new DataView(out.buffer);
+  for(let i=0;i<8;i++) ov.setUint32(i*4,H[i]);
+  return out;
+}
+function _hmacSha256Bytes(keyBytes,dataBytes){
+  const BLOCK=64; let k=new Uint8Array(BLOCK);
+  if(keyBytes.length>BLOCK) keyBytes=_sha256Bytes(keyBytes);
+  k.set(keyBytes);
+  const ipad=new Uint8Array(BLOCK),opad=new Uint8Array(BLOCK);
+  for(let i=0;i<BLOCK;i++){ipad[i]=k[i]^0x36;opad[i]=k[i]^0x5c;}
+  return _sha256Bytes(_concatBytes(opad,_sha256Bytes(_concatBytes(ipad,dataBytes))));
+}
+function _bytesToHex(b){return Array.from(b).map(x=>x.toString(16).padStart(2,"0")).join("");}
+async function _signQuery(query,apiSecret){
+  const msg=new TextEncoder().encode(query), key=new TextEncoder().encode(apiSecret);
+  if(window.crypto&&crypto.subtle){
+    try{
+      const ko=await crypto.subtle.importKey("raw",key,{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+      const sig=await crypto.subtle.sign("HMAC",ko,msg);
+      return _bytesToHex(new Uint8Array(sig));
+    }catch(e){ /* 回退纯 JS */ }
+  }
+  return _bytesToHex(_hmacSha256Bytes(key,msg));
+}
+
+/* ================= 美股交易对清单（美股.txt，215 个） ================= */
+const WATCHLIST = [
+"ZSUSDT","ZMUSDT","ZHONGJIUSDT","ZHIPUUSDT","ZCSHUSDT","XOMUSDT","XLEUSDT","XBIUSDT","WMTUSDT","WENUSDT","WDCUSDT","VUSDT","VSTUSDT","VRTUSDT","VKTXUSDT","UVXYUSDT","USDEXUSDT","USARUSDT","URNMUSDT","UNITREEUSDT","UNHUSDT","UBERUSDT","TZAUSDT","TXNUSDT","TWSTUSDT","TTWOUSDT","TSMUSDT","TSLLUSDT","TSLAUSDT","TQQQUSDT","TMFUSDT","TERUSDT","TENCENTUSDT","TEMUSDT","TEAMUSDT","TBTUSDT","STXXUSDT","STRCUSDT","SQQQUSDT","SPYUSDT","SPCXUSDT","SOXSUSDT","SOXLUSDT","SONYUSDT","SOFIUSDT","SNXXUSDT","SNPSUSDT","SNOWUSDT","SNDKUSDT","SMHUSDT","SMCIUSDT","SKUUUSDT","SKHYUSDT","SKHYNIXUSDT","SKDDUSDT","SHOPUSDT","SHAZUSDT","SECZUSDT","SAMSUNGUSDT","SAMSUNGEMUSDT","RUMUSDT","RKLBUSDT","RIVNUSDT","RDWUSDT","RDDTUSDT","RAMUSDT","QQQUSDT","QNTXUSDT","QCOMUSDT","PYPLUSDT","POPMARTUSDT","PLTRUSDT","PENGUSDT","PDDUSDT","PAYPUSDT","PATHUSDT","PANWUSDT","OURAUSDT","ORCLUSDT","OPENAIUSDT","ONDSUSDT","OKLOUSDT","NVOUSDT","NVDLUSDT","NVDAUSDT","NOWUSDT","NOKUSDT","NKEUSDT","NFLXUSDT","NETUSDT","NBISUSDT","NAVERUSDT","MVLLUSDT","MUUUSDT","MUUSDT","MSTUUSDT","MSTRUSDT","MSFTUSDT","MRVLUSDT","MRNAUSDT","MRKUSDT","MPUSDT","MOONSHOTUSDT","MINIMAXUSDT","METAUSDT","MEITUANUSDT","MDTUSDT","MDBUSDT","MCDUSDT","MARAUSDT","LYTEUSDT","LRCXUSDT","LLYUSDT","LITEUSDT","LGELECTRONICSUSDT","KUAISHOUUSDT","KSTRUSDT","KOUSDT","KORUUSDT","KODEX200USDT","KLACUSDT","JPMUSDT","IWMUSDT","IRENUSDT","IONQUSDT","INTWUSDT","INTCUSDT","IBMUSDT","IBKRUSDT","HYUNDAIUSDT","HUTUSDT","HPEUSDT","HOODUSDT","HK1810USDT","HK0992USDT","HK0700USDT","HK0625USDT","HIMSUSDT","HDUSDT","HANMIUSDT","GTLBUSDT","GSUSDT","GPROUSDT","GOOGLUSDT","GMEUSDT","GLWUSDT","GIGADEVUSDT","GEVUSDT","GDXUSDT","FWDIUSDT","FLNCUSDT","FLEXUSDT","EWZUSDT","EWYUSDT","EWTUSDT","EWJUSDT","EBAYUSDT","DRAMUSDT","DKNGUSDT","DJTUSDT","DISUSDT","DELLUSDT","DDOGUSDT","CYPHUSDT","CXMTUSDT","CVNAUSDT","CSOPSKHYNIX2LUSDT","CSOPSAMSUNG2LUSDT","CSCOUSDT","CRWVUSDT","CRWDUSDT","CRMUSDT","CRMLUSDT","CRDOUSDT","CRCLUSDT","COSTUSDT","COINUSDT","COHRUSDT","CIENUSDT","CEGUSDT","CBRSUSDT","CATUSDT","BYDUSDT","BXUSDT","BWETUSDT","BSPUSDT","BRKBUSDT","BOTUSDT","BNCUSDT","BMNRUSDT","BITOUSDT","BEUSDT","BBXUSDT","BACUSDT","BABAUSDT","AXTIUSDT","AVGOUSDT","ASTSUSDT","ASMLUSDT","ARMUSDT","APPUSDT","APLDUSDT","ANTHROPICUSDT","ANETUSDT","AMZNUSDT","AMDUSDT","AMCUSDT","AMATUSDT","ALABUSDT","AKAMUSDT","AGPUUSDT","ADBEUSDT","ACNUSDT","AAPLUSDT","AAOIUSDT"
+];
+const WATCH_SET = new Set(WATCHLIST);
+document.getElementById("subtitle").textContent =
+  "监视 " + WATCHLIST.length + " 个美股/ETF 交易对 · 密钥仅保存在本浏览器";
+
+/* ================= 核心逻辑 ================= */
+const FAPI = "https://fapi.binance.com";
+// 服务器时间同步（60 秒内不重复；performance.now() 做单调时钟；fapi 失败回退 spot 时间源）
+let serverRefMs = 0, serverRefPerf = 0, syncOk = false;
+async function ensureOffset(){
+  if (syncOk && performance.now() - serverRefPerf < 60000) return;
+  const urls = [FAPI + "/fapi/v1/time", "https://api.binance.com/api/v3/time"];
+  for (const url of urls){
+    try{
+      const d = await fetchJson(url, {method:"GET"}, 8000);
+      const ms = Number(d.serverTime);
+      if (ms > 0){ serverRefMs = ms; serverRefPerf = performance.now(); syncOk = true; return; }
+    }catch(e){ /* 换下一个时间源 */ }
+  }
+  syncOk = false;
+}
+async function forceResync(){ syncOk = false; await ensureOffset(); }
+async function nowMs(){
+  await ensureOffset();
+  if (serverRefMs > 0) return Math.round(serverRefMs + (performance.now() - serverRefPerf));
+  return Date.now();
+}
+
+function loadKeys(){ try{ return JSON.parse(localStorage.getItem("us_keys_v1")||"[]"); }catch(e){ return []; } }
+function saveKeys(k){ try{ localStorage.setItem("us_keys_v1", JSON.stringify(k)); }catch(e){ throw new Error("本浏览器禁用了 localStorage，无法保存密钥"); } }
+
+/* ================= 账户切换下拉 ================= */
+let selAcct = (function(){
+  const v = parseInt(localStorage.getItem("us_acct_v1") || "-1", 10);
+  return isNaN(v) ? -1 : v;
+})();
+function getSelAcct(){ return selAcct; }
+function saveSelAcct(v){ selAcct = v; try{ localStorage.setItem("us_acct_v1", String(v)); }catch(e){} }
+function rebuildAcctSelect(){
+  const sel = document.getElementById("acctSelect");
+  const keys = loadKeys();
+  if (!keys.length){
+    sel.innerHTML = '<option value="-1">（暂无账户，请先设置密钥）</option>';
+    saveSelAcct(-1);
+    return;
+  }
+  let html = "";
+  keys.forEach((k, i) => {
+    const name = (k && k.name) ? k.name : ("账户" + (i+1));
+    html += '<option value="' + i + '">' + name + '</option>';
+  });
+  sel.innerHTML = html;
+  if (getSelAcct() < 0 || getSelAcct() >= keys.length) saveSelAcct(0);   // 默认第 1 个账户
+  sel.value = String(getSelAcct());
+}
+document.getElementById("acctSelect").addEventListener("change", e => {
+  const v = parseInt(e.target.value, 10);
+  saveSelAcct(isNaN(v) ? -1 : v);             // 修复 value="0" 被 || 误判成 -1
+  render();
+  refresh();                                  // 切换账户立即拉最新数据，不用再进密钥弹窗
+});
+
+/* ============ 网络请求：统一超时 + 网络错误自动重试 1 次 ============ */
+async function fetchJson(url, opts, timeoutMs){
+  const t = timeoutMs || 15000;
+  const mk = () => Object.assign({}, opts, {signal: AbortSignal.timeout(t)});
+  try{
+    const r = await fetch(url, mk());
+    return await r.json();
+  }catch(e){
+    if (e && e.name === "TimeoutError") throw e;               // 超时不重试，快速报错
+    const r2 = await fetch(url, mk());                         // 网络波动重试 1 次
+    return await r2.json();
+  }
+}
+/* 签名请求统一入口：GET/POST/DELETE 共用一个，-1021 时间偏差自动重同步重试 1 次 */
+async function signedFetch(acct, method, path, query){
+  const doFetch = async (q) => {
+    const sig = await _signQuery(q, acct.api_secret);
+    return fetchJson(FAPI + path + "?" + q + "&signature=" + sig,
+      {method, headers:{"X-MBX-APIKEY": acct.api_key}});
+  };
+  let data = await doFetch(query);
+  if (data && data.code === -1021){
+    await forceResync();
+    data = await doFetch(query.replace(/timestamp=\d+/, "timestamp=" + (await nowMs())));
+  }
+  return data;
+}
+async function apiGet(acct, path){
+  const query = "timestamp=" + (await nowMs()) + "&recvWindow=10000";
+  const data = await signedFetch(acct, "GET", path, query);
+  if (data && typeof data === "object" && data.code === -1022) throw new Error("API 密钥签名无效(-1022)");
+  if (data && typeof data === "object" && data.code === -2014) throw new Error("API 密钥无效(-2014)");
+  if (data && typeof data === "object" && data.code !== undefined) throw new Error("接口错误 code " + data.code + ": " + (data.msg||""));
+  return data;
+}
+
+function positionInfo(p){
+  const amt = parseFloat(p.positionAmt) || 0;
+  const entry = parseFloat(p.entryPrice) || 0;
+  const mark = parseFloat(p.markPrice) || 0;
+  const unrealized = parseFloat(p.unRealizedProfit) || 0;
+  const lev = parseFloat(p.leverage) || 0;
+  let margin = parseFloat(p.positionInitialMargin) || parseFloat(p.isolatedMargin) || parseFloat(p.initialMargin) || 0;
+  if (margin <= 0){ const notional = Math.abs(parseFloat(p.notional) || (amt*mark)); if (lev>0 && notional>0) margin = notional/lev; }
+  const roi = margin>0 ? (unrealized/margin*100) : 0;
+  const notional = Math.abs(amt) * mark;
+  return { symbol:p.symbol, amt, entry, mark, unrealized, margin, roi, notional };
+}
+
+function fmtNum(v){
+  if (v === 0) return "0";
+  const abs = Math.abs(v);
+  if (abs >= 1000) return v.toLocaleString("en-US", {maximumFractionDigits:2});
+  return String(parseFloat(v.toFixed(8)));
+}
+function fmtRoi(v){ return (v>=0?"+":"") + v.toFixed(2) + "%"; }
+function fmtUsd(v){ return (v>=0?"+$":"-$") + Math.abs(v).toLocaleString("en-US",{maximumFractionDigits:2}); }
+
+let allRows = [];   // {acct, symbol, amt, roi, margin, unrealized}
+
+async function refresh(){
+  const accounts = loadKeys().filter(a => a && a.api_key && a.api_secret);
+  const statusEl = document.getElementById("status");
+  if (accounts.length === 0){
+    statusEl.innerHTML = "请先点击「添加账户」填写 API Key / Secret。";
+    document.getElementById("p1body").innerHTML = emptyRow("请先设置 API 密钥");
+    document.getElementById("p2body").innerHTML = emptyRow("请先设置 API 密钥");
+    document.getElementById("p1count").textContent = "";
+    document.getElementById("p2count").textContent = "";
+    return;
+  }
+  statusEl.innerHTML = "正在加载 " + accounts.length + " 个账户…<span class='loading-dots'></span>";
+  let rows = [], errors = [], ok = 0;
+  await ensureOffset();
+  await Promise.all(accounts.map(async (acct, idx) => {
+    try {
+      const data = await apiGet(acct, "/fapi/v2/positionRisk");
+      if (!Array.isArray(data)) throw new Error("返回格式异常");
+      for (const p of data){
+        const amt = parseFloat(p.positionAmt) || 0;
+        if (amt === 0) continue;
+        if (!WATCH_SET.has(p.symbol)) continue;
+        const info = positionInfo(p);
+        rows.push({ acct: acct.name || ("账户"+(idx+1)), acctIdx: idx, symbol:p.symbol, amt, notional:info.notional, roi:info.roi, margin:info.margin, unrealized:info.unrealized });
+      }
+      ok++;
+    } catch(e){ errors.push((acct.name||("账户"+(idx+1))) + ": " + e.message); }
+  }));
+  allRows = rows;
+  render();
+  const t = new Date().toLocaleTimeString("zh-CN", {hour12:false});
+  const posCount = new Set(rows.map(r=>r.symbol)).size;
+  statusEl.innerHTML = "已加载 " + ok + "/" + accounts.length + " 账户 · 有仓位的交易对 " +
+    posCount + " 个 · 无仓位 " + (WATCHLIST.length - posCount) + " 个 · 更新于 " + t +
+    (errors.length ? " · 失败: " + errors.join("；") : "");
+}
+
+function emptyRow(msg, span){
+  const s = span || 6;
+  return '<tr><td colspan="' + s + '" class="empty"><div class="big">' + msg + '</div></td></tr>';
+}
+
+function fmtQtyUsd(v){ return "$" + Math.abs(v).toLocaleString("en-US",{maximumFractionDigits:2}); }
+
+function cellHtml(r, grp){
+  const sideCls = r.amt > 0 ? "side-long" : "side-short";
+  const sideTxt = r.amt > 0 ? "多" : "空";
+  const roiCls = r.roi > 0.001 ? "roi-pos" : (r.roi < -0.001 ? "roi-neg" : "roi-zero");
+  const pnlCls = r.unrealized >= 0 ? "pnl-pos" : "pnl-neg";
+  const cls = grp ? "grp-a grp-row" : "";
+  return '<tr class="' + cls + '">' +
+    '<td class="sym">' + r.symbol + '</td>' +
+    '<td class="acct">' + r.acct + '</td>' +
+    '<td class="' + sideCls + '">' + sideTxt + '</td>' +
+    '<td class="num">' + fmtQtyUsd(r.notional) + '</td>' +
+    '<td class="num ' + pnlCls + '">' + fmtUsd(r.unrealized) + '</td>' +
+    '<td class="num ' + roiCls + '">' + fmtRoi(r.roi) + '</td>' +
+    '<td><button class="btn-add" data-add="' + r.symbol + "|" + r.acctIdx + '">加仓</button></td></tr>';
+}
+
+function render(){
+  // 账户筛选：默认第 1 个账户，可切换；无选中时显示空
+  const SEL = getSelAcct();
+  const viewRows = SEL >= 0 ? allRows.filter(r => r.acctIdx === SEL) : [];
+
+  // ---- 页 1：回报率 ≥ 100% ----
+  const p1 = viewRows.filter(r => r.roi >= 100).sort((a,b) => b.roi - a.roi);
+  document.getElementById("p1count").textContent = p1.length ? "共 " + p1.length + " 条" : "";
+  document.getElementById("p1body").innerHTML = p1.length
+    ? p1.map(r => cellHtml(r, false)).join("")
+    : emptyRow("当前没有回报率 ≥ 100% 的持仓", 7);
+
+  // ---- 页 2：同币多空对冲（不同账户同一币种同时持多+空，两边都未爆仓 roi > -100）----
+  const bySym = {};
+  for (const r of viewRows){
+    if (!bySym[r.symbol]) bySym[r.symbol] = {longs:[], shorts:[]};
+    if (r.amt > 0) bySym[r.symbol].longs.push(r); else bySym[r.symbol].shorts.push(r);
+  }
+  const p2 = [];
+  const hedgeSyms = [];
+  const symbols = Object.keys(bySym).sort();
+  for (const sym of symbols){
+    const g = bySym[sym];
+    if (g.longs.length === 0 || g.shorts.length === 0) continue;
+    const allDeep = g.longs.every(r=>r.roi <= -100) && g.shorts.every(r=>r.roi <= -100);
+    if (!allDeep) continue;
+    hedgeSyms.push(sym);
+    p2.push(...g.longs, ...g.shorts);
+  }
+  document.getElementById("p2count").textContent = p2.length ? "共 " + p2.length + " 条 · " + hedgeSyms.length + " 个币种" : "";
+  if (p2.length){
+    let last = "", grpFlip = false, html = "";
+    for (const r of p2){
+      if (r.symbol !== last){
+        if (last !== "") html += '<tr class="grp-gap"><td colspan="7"></td></tr>';
+        grpFlip = !grpFlip; last = r.symbol;
+      }
+      html += cellHtml(r, grpFlip);
+    }
+    document.getElementById("p2body").innerHTML = html;
+  } else {
+    document.getElementById("p2body").innerHTML = emptyRow("当前没有「多空两边都亏超 -100%」的同币持仓", 7);
+  }
+
+  // ---- 页 3：开仓（缺失的多空方向）----
+  const hasL = {}, hasS = {};
+  for (const r of viewRows){
+    if (r.amt > 0) hasL[r.symbol] = true; else hasS[r.symbol] = true;
+  }
+  const p3rows = [];
+  for (const s of WATCHLIST){
+    const l = !!hasL[s], sh = !!hasS[s];
+    if (l && sh) continue;                      // 多空都有 → 不用开仓
+    if (l) p3rows.push({symbol:s, dir:"空", cls:"side-short"});      // 有多单 → 缺空单
+    else if (sh) p3rows.push({symbol:s, dir:"多", cls:"side-long"}); // 有空单 → 缺多单
+    else p3rows.push({symbol:s, dir:"多", cls:"side-long"}, {symbol:s, dir:"空", cls:"side-short"}); // 无持仓 → 两行
+  }
+  p3rows.sort((a,b) => a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : (a.dir === "多" ? -1 : 1));
+  const p3symCount = new Set(p3rows.map(r=>r.symbol)).size;
+  document.getElementById("p3count").textContent = p3rows.length ? "共 " + p3rows.length + " 条 · " + p3symCount + " 个交易对缺方向" : "";
+  document.getElementById("p3body").innerHTML = p3rows.length
+    ? p3rows.map(r => '<tr><td class="sym">' + r.symbol + '</td><td class="' + r.cls + '">' + r.dir + '</td><td>' + btnOpenHtml(r.symbol, r.dir) + '</td></tr>').join("")
+    : emptyRow("全部 " + WATCHLIST.length + " 个交易对多空方向都齐，无需开仓", 3);
+}
+
+/* ================= 开仓（页 3） ================= */
+const OPENED_KEY = "us_opened_v1";
+let OPENED = {};
+function loadOpened(){
+  try{
+    const arr = JSON.parse(localStorage.getItem(OPENED_KEY)||"[]");
+    OPENED = {};
+    for (const o of arr) OPENED[o.sym + ":" + o.dir] = o;
+  }catch(e){ OPENED = {}; }
+  return OPENED;
+}
+function saveOpened(){
+  const arr = Object.entries(OPENED).map(([k,o])=>({sym:o.sym, dir:o.dir, t:o.t}));
+  try{ localStorage.setItem(OPENED_KEY, JSON.stringify(arr)); }catch(e){}
+}
+function fmtTime(ms){
+  const d = new Date(ms);
+  return ("0"+d.getHours()).slice(-2) + ":" + ("0"+d.getMinutes()).slice(-2) + ":" + ("0"+d.getSeconds()).slice(-2);
+}
+function btnOpenHtml(sym, dir){
+  const key = sym + ":" + dir;
+  const done = OPENED[key];
+  if (done) return '<button class="btn-open" disabled>已开仓 ' + fmtTime(done.t) + '</button>';
+  return '<button class="btn-open" data-open="' + sym + "|" + dir + '">开仓</button>';
+}
+const RULES_KEY = "us_rules_v2";
+let rulesCache = null;
+async function getRules(){
+  if (rulesCache) return rulesCache;
+  try{                                    // 优先本地缓存（6 小时内），避免重复下载大文件
+    const c = JSON.parse(localStorage.getItem(RULES_KEY) || "null");
+    if (c && c.map && Date.now() - c.t < 6*3600*1000){ rulesCache = c.map; return rulesCache; }
+  }catch(e){}
+  const d = await fetchJson(FAPI + "/fapi/v1/exchangeInfo", {method:"GET"}, 40000);
+  const map = {};
+  for (const s of (d.symbols||[])){
+    if (!WATCH_SET.has(s.symbol)) continue;      // 只解析监控清单里的交易对
+    const f = {};
+    for (const x of (s.filters||[])) f[x.filterType] = x;
+    const lot = f.MARKET_LOT_SIZE || f.LOT_SIZE;
+    let step = parseFloat((lot||{}).stepSize) || 0;
+    if (step <= 0) step = Math.pow(10, -(parseInt(s.quantityPrecision,10)||4));
+    map[s.symbol] = {
+      minNotional: parseFloat((f.MIN_NOTIONAL||{}).notional) || 0,
+      step,
+      minQty: parseFloat((lot||{}).minQty) || 0
+    };
+  }
+  rulesCache = map;
+  try{ localStorage.setItem(RULES_KEY, JSON.stringify({t: Date.now(), map})); }catch(e){}
+  return map;
+}
+async function apiPost(acct, query){
+  return signedFetch(acct, "POST", "/fapi/v1/order", query);
+}
+async function openPos(sym, dir){
+  const msg = document.getElementById("p3msg");
+  const btn = document.querySelector('#p3body button[data-open="' + sym + "|" + dir + '"]');
+  if (!btn || btn.disabled) return;
+  btn.disabled = true; btn.textContent = "开仓中…";
+  try{
+    const accounts = loadKeys().filter(a => a && a.api_key && a.api_secret);
+    if (!accounts.length) throw new Error("请先设置 API 密钥");
+    const SEL = getSelAcct();
+    const acct = SEL >= 0 ? accounts[SEL] : accounts[0];
+    if (!acct) throw new Error("请先在下拉框选择要开仓的账户");
+    const rule = (await getRules())[sym];
+    if (!rule || !rule.minNotional) throw new Error("未获取到系统最小开仓额");
+    const minN = rule.minNotional;
+    const price = await getPrice(sym);
+    const qty = calcAddQty(price, rule);
+    const actual = qty * price;
+    const side = dir === "多" ? "BUY" : "SELL";
+    const query = "symbol=" + sym + "&side=" + side + "&type=MARKET&quantity=" + qty + "&newOrderRespType=ACK&recvWindow=10000&timestamp=" + (await nowMs());
+    const data = await apiPost(acct, query);
+    if (data && data.code !== undefined){
+      throw new Error("code " + data.code + ": " + (data.msg||""));
+    }
+    OPENED[sym + ":" + dir] = {sym, dir, t:Date.now()};
+    saveOpened();
+    btn.disabled = true; btn.textContent = "已开仓 " + fmtTime(OPENED[sym + ":" + dir].t);
+    msg.className = "pmsg ok";
+    msg.textContent = sym + " " + side + " 市价开仓成功 · 金额约 " + actual.toFixed(2) + " USDT（系统最小 " + minN.toFixed(2) + " + 1）· 数量 " + qty;
+  }catch(e){
+    msg.className = "pmsg err";
+    msg.textContent = sym + " 开仓失败：" + e.message;
+    btn.disabled = false; btn.textContent = "开仓";
+  }
+}
+
+/* ================= 加仓（页 1 / 页 2） ================= */
+async function apiDelete(acct, path, query){
+  return signedFetch(acct, "DELETE", path, query);
+}
+async function getPrice(sym){
+  const d = await fetchJson(FAPI + "/fapi/v1/ticker/price?symbol=" + sym, {method:"GET"}, 8000);
+  const p = parseFloat(d.price);
+  if (!p) throw new Error("获取当前价格失败");
+  return p;
+}
+function calcAddQty(price, rule){
+  const minN = rule.minNotional;
+  const target = minN + 1;
+  let qty = Math.floor((target / price) / rule.step) * rule.step;
+  qty = Math.round(qty * 1e8) / 1e8;
+  if (qty * price < minN){
+    qty = Math.ceil((minN / price) / rule.step) * rule.step;
+    qty = Math.round(qty * 1e8) / 1e8;
+  }
+  if (qty < rule.minQty) qty = rule.minQty;
+  return qty;
+}
+// 取当前持仓（含回报率，加仓前核对 / 加仓后用于设止损）
+async function getPosition(acct, sym){
+  const data = await apiGet(acct, "/fapi/v2/positionRisk?symbol=" + sym);
+  if (!Array.isArray(data)) throw new Error("查询持仓失败");
+  for (const p of data){
+    const amt = parseFloat(p.positionAmt) || 0;
+    if (amt !== 0){
+      const info = positionInfo(p);
+      return { amt, mark: info.mark, unrealized: info.unrealized, roi: info.roi };
+    }
+  }
+  return null;
+}
+// 取消该仓位已有的止盈止损（只取消 closePosition=true 的仓位级订单）
+async function cancelPosSL(acct, sym){
+  const orders = await fetchJson(FAPI + "/fapi/v1/openOrders?symbol=" + sym,
+    {headers:{"X-MBX-APIKEY": acct.api_key}}, 8000);
+  if (!Array.isArray(orders)) return 0;
+  let n = 0;
+  for (const o of orders){
+    if (o.closePosition === true){
+      const q = "symbol=" + sym + "&orderId=" + o.orderId + "&recvWindow=10000&timestamp=" + (await nowMs());
+      const d = await apiDelete(acct, "/fapi/v1/order", q);
+      if (!(d && d.code !== undefined)) n++;
+    }
+  }
+  return n;
+}
+// 设置仓位止损：止损价 = 现价 ∓ 浮盈×50% ÷ 数量（锁定一半浮盈，回撤到剩 50% 利润触发）
+async function setStopLoss(acct, sym, pos){
+  const amtAbs = Math.abs(pos.amt);
+  if (!(pos.unrealized > 0) || amtAbs <= 0){
+    throw new Error("当前无浮盈，跳过止损设置");
+  }
+  const half = pos.unrealized * 0.5 / amtAbs;
+  const stopPrice = pos.amt > 0 ? pos.mark - half : pos.mark + half;
+  const side = pos.amt > 0 ? "SELL" : "BUY";
+  const query = "symbol=" + sym + "&side=" + side + "&type=STOP_MARKET&stopPrice=" + stopPrice +
+    "&closePosition=true&workingType=MARK_PRICE&timeInForce=GTC&newOrderRespType=ACK&recvWindow=10000&timestamp=" + (await nowMs());
+  const data = await apiPost(acct, query);
+  if (data && data.code !== undefined) throw new Error("设止损失败 code " + data.code + ": " + (data.msg||""));
+  return stopPrice;
+}
+async function addPos(sym, acctIdx, setSL){
+  const msg = document.getElementById(setSL ? "p1msg" : "p2msg");
+  const btn = document.querySelector('#p1body button[data-add="' + sym + "|" + acctIdx + '"], #p2body button[data-add="' + sym + "|" + acctIdx + '"]');
+  if (!btn || btn.disabled) return;
+  btn.disabled = true; btn.textContent = "加仓中…";
+  try{
+    const accounts = loadKeys().filter(a => a && a.api_key && a.api_secret);
+    const acct = accounts[acctIdx];
+    if (!acct) throw new Error("账户不存在");
+    const rule = (await getRules())[sym];
+    if (!rule || !rule.minNotional) throw new Error("未获取到最小加仓额");
+    const price = await getPrice(sym);
+    const qty = calcAddQty(price, rule);
+    // 取当前仓位方向
+    const cur = allRows.find(r => r.symbol === sym && r.acctIdx === acctIdx);
+    if (!cur) throw new Error("找不到该持仓");
+    // 页 1 专属条件：加仓前实时核对回报率 ≥ 100%，回撤到 100% 以下不执行（防波动回撤）
+    if (setSL){
+      const pre = await getPosition(acct, sym);
+      if (!pre) throw new Error("查询持仓失败，未执行加仓");
+      if (pre.roi < 100) throw new Error("投资回报率小于100%");
+    }
+    const side = cur.amt > 0 ? "BUY" : "SELL";
+    const query = "symbol=" + sym + "&side=" + side + "&type=MARKET&quantity=" + qty + "&newOrderRespType=ACK&recvWindow=10000&timestamp=" + (await nowMs());
+    const data = await apiPost(acct, query);
+    if (data && data.code !== undefined) throw new Error("加仓失败 code " + data.code + ": " + (data.msg||""));
+    let slTxt = "";
+    if (setSL){
+      const pos = await getPosition(acct, sym);
+      if (!pos) throw new Error("加仓成功但查询持仓失败（跳过止损）");
+      const canceled = await cancelPosSL(acct, sym);
+      const stopPrice = await setStopLoss(acct, sym, pos);
+      slTxt = " · 已取消旧止损 " + canceled + " 单 · 新止损 " + stopPrice.toFixed(4) +
+        "（浮盈 " + fmtUsd(pos.unrealized) + " 回撤 50% 即 " + fmtUsd(pos.unrealized * 0.5) + " 触发）";
+    }
+    msg.className = "pmsg ok";
+    msg.textContent = sym + " 加仓成功 · " + side + " " + qty + "（金额约 " + (qty * price).toFixed(2) + " USDT，最小 " + rule.minNotional.toFixed(2) + " + 1）" + slTxt;
+  }catch(e){
+    msg.className = "pmsg err";
+    msg.textContent = sym + " 加仓失败：" + e.message;
+    btn.disabled = false; btn.textContent = "加仓";
+  }
+}
+
+/* ================= 密钥弹窗 ================= */
+function openKeysModal(){
+  const keys = loadKeys();
+  while (keys.length < 1) keys.push({name:"账户1", api_key:"", api_secret:""});
+  const rows = document.getElementById("keyRows");
+  rows.innerHTML = "";
+  keys.forEach((k, i) => {
+    const row = document.createElement("div");
+    row.className = "key-row";
+    row.innerHTML =
+      '<input data-f="name" placeholder="账户名" value="' + escAttr(k.name||("账户"+(i+1))) + '">' +
+      '<input data-f="api_key" placeholder="API Key" spellcheck="false" value="' + escAttr(k.api_key||"") + '">' +
+      '<input data-f="api_secret" placeholder="API Secret" spellcheck="false" value="' + escAttr(k.api_secret||"") + '">' +
+      '<button class="del" title="删除该账户">✕</button>';
+    rows.appendChild(row);
+  });
+  document.getElementById("keyErr").textContent = "";
+  document.getElementById("overlay").classList.add("show");
+}
+function escAttr(s){ return s.replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
+function closeKeysModal(){ document.getElementById("overlay").classList.remove("show"); }
+
+document.getElementById("btnKeys").addEventListener("click", openKeysModal);
+document.getElementById("btnCancel").addEventListener("click", closeKeysModal);
+document.getElementById("btnAddKey").addEventListener("click", () => {
+  const rows = document.querySelectorAll("#keyRows .key-row");
+  const row = document.createElement("div");
+  row.className = "key-row";
+  row.innerHTML =
+    '<input data-f="name" placeholder="账户名" value="账户' + (rows.length+1) + '">' +
+    '<input data-f="api_key" placeholder="API Key" spellcheck="false">' +
+    '<input data-f="api_secret" placeholder="API Secret" spellcheck="false">' +
+    '<button class="del" title="删除该账户">✕</button>';
+  document.getElementById("keyRows").appendChild(row);
+});
+document.getElementById("keyRows").addEventListener("click", e => {
+  if (e.target.classList.contains("del")){
+    const rows = document.querySelectorAll("#keyRows .key-row");
+    if (rows.length <= 1){ document.getElementById("keyErr").textContent = "至少保留 1 个账户"; return; }
+    e.target.closest(".key-row").remove();
+  }
+});
+document.getElementById("btnSave").addEventListener("click", () => {
+  const keys = [];
+  document.querySelectorAll("#keyRows .key-row").forEach(row => {
+    const name = row.querySelector('[data-f="name"]').value.trim() || "账户" + (keys.length+1);
+    const api_key = row.querySelector('[data-f="api_key"]').value.trim();
+    const api_secret = row.querySelector('[data-f="api_secret"]').value.trim();
+    keys.push({name, api_key, api_secret});
+  });
+  saveKeys(keys);
+  rebuildAcctSelect();
+  closeKeysModal();
+  refresh();
+});
+
+/* ================= 标签页切换 ================= */
+document.querySelectorAll("nav.tabs button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("nav.tabs button").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    document.querySelectorAll("section.panel").forEach(s => s.classList.remove("active"));
+    document.getElementById(btn.dataset.page).classList.add("active");
+  });
+});
+document.getElementById("btnRefresh").addEventListener("click", refresh);
+
+/* 页 3 开仓按钮（事件委托） */
+document.getElementById("p3body").addEventListener("click", e => {
+  const b = e.target.closest("button[data-open]");
+  if (!b) return;
+  const parts = b.dataset.open.split("|");
+  openPos(parts[0], parts[1]);
+});
+
+/* 页 1 / 页 2 加仓按钮（事件委托） */
+document.getElementById("p1body").addEventListener("click", e => {
+  const b = e.target.closest("button[data-add]");
+  if (!b) return;
+  const parts = b.dataset.add.split("|");
+  addPos(parts[0], parseInt(parts[1],10), true);   // 页 1：加仓 + 设止损
+});
+document.getElementById("p2body").addEventListener("click", e => {
+  const b = e.target.closest("button[data-add]");
+  if (!b) return;
+  const parts = b.dataset.add.split("|");
+  addPos(parts[0], parseInt(parts[1],10), false);  // 页 2：只加仓
+});
+
+/* ================= 启动 ================= */
+loadOpened();
+rebuildAcctSelect();
+document.getElementById("p1body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 7);
+document.getElementById("p2body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 7);
+document.getElementById("p3body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 3);
+if (loadKeys().some(k => k && k.api_key && k.api_secret)) refresh();
+</script>
+</body>
+</html>
