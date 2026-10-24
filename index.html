@@ -681,23 +681,24 @@ async function getPosition(acct, sym, dir){
   }
   return null;
 }
-// 取消该仓位已有的止盈止损（只取消 closePosition=true 的仓位级订单）
-async function cancelPosSL(acct, sym){
-  const orders = await fetchJson(FAPI + "/fapi/v1/openOrders?symbol=" + sym,
-    {headers:{"X-MBX-APIKEY": acct.api_key}}, 8000);
+// 取消该仓位已有的止盈止损（只取消 closePosition=true 的仓位级订单，按方向过滤）
+async function cancelPosSL(acct, sym, dir){
+  const q = "symbol=" + sym + "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
+  const orders = await signedFetch(acct, "GET", "/fapi/v1/openOrders", q);
   if (!Array.isArray(orders)) return 0;
+  const wantPS = dir === "long" ? "LONG" : "SHORT";
   let n = 0;
   for (const o of orders){
-    if (o.closePosition === true){
-      const q = "symbol=" + sym + "&orderId=" + o.orderId + "&recvWindow=10000&timestamp=" + (await nowMs());
-      const d = await apiDelete(acct, "/fapi/v1/order", q);
-      if (!(d && d.code !== undefined)) n++;
-    }
+    if (o.closePosition !== true) continue;
+    // 双向持仓只撤同方向的止损；单向持仓 positionSide 为 BOTH，不过滤
+    if (o.positionSide && o.positionSide !== "BOTH" && o.positionSide !== wantPS) continue;
+    const d = await apiDelete(acct, "/fapi/v1/order", "symbol=" + sym + "&orderId=" + o.orderId);
+    if (!(d && d.code !== undefined)) n++;
   }
   return n;
 }
-// 设置仓位止损：止损价 = 现价 ∓ 浮盈×50% ÷ 数量（锁定一半浮盈，回撤到剩 50% 利润触发）
-async function setStopLoss(acct, sym, pos){
+// 设置仓位止损：浮盈回撤 50% 时触发（浮盈 5U → 回撤到剩 2.5U 对应价格）
+async function setStopLoss(acct, sym, pos, dir){
   const amtAbs = Math.abs(pos.amt);
   if (!(pos.unrealized > 0) || amtAbs <= 0){
     throw new Error("当前无浮盈，跳过止损设置");
@@ -744,8 +745,8 @@ async function addPos(sym, acctIdx, setSL, dir){
     if (setSL){
       const pos = await getPosition(acct, sym, dir);
       if (!pos) throw new Error("加仓成功但查询持仓失败（跳过止损）");
-      const canceled = await cancelPosSL(acct, sym);
-      const stopPrice = await setStopLoss(acct, sym, pos);
+      const canceled = await cancelPosSL(acct, sym, dir);
+      const stopPrice = await setStopLoss(acct, sym, pos, dir);
       slTxt = " · 已取消旧止损 " + canceled + " 单 · 新止损 " + stopPrice.toFixed(4) +
         "（浮盈 " + fmtUsd(pos.unrealized) + " 回撤 50% 即 " + fmtUsd(pos.unrealized * 0.5) + " 触发）";
     }
