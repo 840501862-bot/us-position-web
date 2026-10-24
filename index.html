@@ -682,24 +682,36 @@ async function getPosition(acct, sym, dir){
   }
   return null;
 }
-// 取消该仓位已有的止盈止损（只取消 closePosition=true 的仓位级订单，按方向过滤）
-async function cancelPosSL(acct, sym, dir){
-  const q = "symbol=" + sym + "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
-  const orders = await signedFetch(acct, "GET", "/fapi/v1/openOrders", q);
-  if (!Array.isArray(orders)) return 0;
-  const wantPS = dir === "long" ? "LONG" : "SHORT";
-  let n = 0;
-  for (const o of orders){
-    if (o.closePosition !== true) continue;
-    // 双向持仓只撤同方向的止损；单向持仓 positionSide 为 BOTH，不过滤
-    if (o.positionSide && o.positionSide !== "BOTH" && o.positionSide !== wantPS) continue;
-    const d = await apiDelete(acct, "/fapi/v1/order", "symbol=" + sym + "&orderId=" + o.orderId);
-    if (!(d && d.code !== undefined)) n++;
+// 本地跟踪已挂的算法止损单：{acctIdx, symbol, dir, clientAlgoId, triggerPrice, created}
+const SL_STORE = "us_sl_v1";
+function loadSLTracking(){ try{ const a = JSON.parse(localStorage.getItem(SL_STORE)||"[]"); return Array.isArray(a)?a:[]; }catch(e){ return []; } }
+function saveSLTracking(a){ try{ localStorage.setItem(SL_STORE, JSON.stringify(a)); }catch(e){} }
+function newClientAlgoId(){
+  const hex = Array.from(crypto.getRandomValues(new Uint8Array(15)))
+    .map(b => b.toString(16).padStart(2,"0")).join("");
+  return ("SL"+hex).toUpperCase().slice(0,32);
+}
+// 撤算法止损单（按 clientAlgoId）
+async function cancelAlgo(acct, clientAlgoId){
+  const q = "clientAlgoId=" + clientAlgoId + "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
+  return await signedFetch(acct, "DELETE", "/fapi/v1/algoOrder", q);
+}
+// 撤掉该账户该币该方向的旧算法止损单（按本地跟踪表）
+async function cancelPosSL(acct, acctIdx, sym, dir){
+  const all = loadSLTracking();
+  const kept = [], canceled = [];
+  for (const o of all){
+    if (o.acctIdx === acctIdx && o.symbol === sym && o.dir === dir){
+      try{ await cancelAlgo(acct, o.clientAlgoId); canceled.push(o.clientAlgoId); }
+      catch(e){ kept.push(o); }   // 撤失败保留，下次再试
+    } else kept.push(o);
   }
-  return n;
+  saveSLTracking(kept);
+  return canceled.length;
 }
 // 设置仓位止损：浮盈回撤 50% 时触发（浮盈 5U → 回撤到剩 2.5U 对应价格）
-async function setStopLoss(acct, sym, pos, dir){
+// 走 Algo Order API（/fapi/v1/algoOrder），closePosition=true 的仓位级止损必须走这个接口
+async function setStopLoss(acct, acctIdx, sym, pos, dir){
   const amtAbs = Math.abs(pos.amt);
   if (!(pos.unrealized > 0) || amtAbs <= 0){
     throw new Error("当前无浮盈，跳过止损设置");
@@ -707,11 +719,27 @@ async function setStopLoss(acct, sym, pos, dir){
   const half = pos.unrealized * 0.5 / amtAbs;
   const stopPrice = pos.amt > 0 ? pos.mark - half : pos.mark + half;
   const side = pos.amt > 0 ? "SELL" : "BUY";
-  const wantDir = pos.amt > 0 ? "long" : "short";   // 平多止损对应 LONG 仓位，平空对应 SHORT
-  const baseQ = "symbol=" + sym + "&side=" + side + "&type=STOP_MARKET&stopPrice=" + stopPrice +
-    "&closePosition=true&workingType=MARK_PRICE&newOrderRespType=ACK";
-  const data = await postOrderAuto(acct, baseQ, wantDir);
+  const wantDir = pos.amt > 0 ? "long" : "short";
+  const clientAlgoId = newClientAlgoId();
+  // positionSide 候选：双向 LONG/SHORT，单向 BOTH
+  const cands = wantDir === "long" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
+  let data = null, lastErr = null;
+  for (const ps of cands){
+    const q = "algoType=CONDITIONAL&symbol=" + sym + "&side=" + side +
+      "&type=STOP_MARKET&triggerPrice=" + stopPrice.toFixed(6) +
+      "&closePosition=true&workingType=MARK_PRICE&positionSide=" + ps +
+      "&clientAlgoId=" + clientAlgoId +
+      "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
+    data = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
+    if (!(data && data.code === -4061)) break;   // -4061 换 positionSide 重试
+    lastErr = data;
+  }
   if (data && data.code !== undefined) throw new Error("设止损失败 code " + data.code + ": " + (data.msg||""));
+  // 记入本地跟踪表
+  const all = loadSLTracking();
+  all.push({acctIdx, symbol:sym, dir:wantDir, clientAlgoId, triggerPrice:stopPrice,
+            created:new Date().toLocaleString("zh-CN",{hour12:false})});
+  saveSLTracking(all);
   return stopPrice;
 }
 async function addPos(sym, acctIdx, setSL, dir){
@@ -746,8 +774,8 @@ async function addPos(sym, acctIdx, setSL, dir){
     if (setSL){
       const pos = await getPosition(acct, sym, dir);
       if (!pos) throw new Error("加仓成功但查询持仓失败（跳过止损）");
-      const canceled = await cancelPosSL(acct, sym, dir);
-      const stopPrice = await setStopLoss(acct, sym, pos, dir);
+      const canceled = await cancelPosSL(acct, acctIdx, sym, dir);
+      const stopPrice = await setStopLoss(acct, acctIdx, sym, pos, dir);
       slTxt = " · 已取消旧止损 " + canceled + " 单 · 新止损 " + stopPrice.toFixed(4) +
         "（浮盈 " + fmtUsd(pos.unrealized) + " 回撤 50% 即 " + fmtUsd(pos.unrealized * 0.5) + " 触发）";
     }
