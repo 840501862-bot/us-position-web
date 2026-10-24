@@ -552,7 +552,7 @@ function btnOpenHtml(sym, dir){
   if (done) return '<button class="btn-open" disabled>已开仓 ' + fmtTime(done.t) + '</button>';
   return '<button class="btn-open" data-open="' + sym + "|" + dir + '">开仓</button>';
 }
-const RULES_KEY = "us_rules_v2";
+const RULES_KEY = "us_rules_v3";
 let rulesCache = null;
 async function getRules(){
   if (rulesCache) return rulesCache;
@@ -572,7 +572,8 @@ async function getRules(){
     map[s.symbol] = {
       minNotional: parseFloat((f.MIN_NOTIONAL||{}).notional) || 0,
       step,
-      minQty: parseFloat((lot||{}).minQty) || 0
+      minQty: parseFloat((lot||{}).minQty) || 0,
+      pricePrec: parseInt(s.pricePrecision, 10) || 2
     };
   }
   rulesCache = map;
@@ -721,12 +722,15 @@ async function setStopLoss(acct, acctIdx, sym, pos, dir){
   const side = pos.amt > 0 ? "SELL" : "BUY";
   const wantDir = pos.amt > 0 ? "long" : "short";
   const clientAlgoId = newClientAlgoId();
+  const rule = (await getRules())[sym] || {};
+  const pp = rule.pricePrec || 2;
+  const triggerPrice = stopPrice.toFixed(pp);
   // positionSide 候选：双向 LONG/SHORT，单向 BOTH
   const cands = wantDir === "long" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
   let data = null, lastErr = null;
   for (const ps of cands){
     const q = "algoType=CONDITIONAL&symbol=" + sym + "&side=" + side +
-      "&type=STOP_MARKET&triggerPrice=" + stopPrice.toFixed(6) +
+      "&type=STOP_MARKET&triggerPrice=" + triggerPrice +
       "&closePosition=true&positionSide=" + ps +
       "&clientAlgoId=" + clientAlgoId +
       "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
