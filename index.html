@@ -669,7 +669,8 @@ function calcAddQty(price, rule, currentQty){
 // 取当前持仓（含回报率，加仓前核对 / 加仓后用于设止损）
 // dir: "long"/"short"，按方向精确取仓（双向持仓下同币有多空两行）
 async function getPosition(acct, sym, dir){
-  const data = await apiGet(acct, "/fapi/v2/positionRisk?symbol=" + sym);
+  const q = "symbol=" + sym + "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
+  const data = await signedFetch(acct, "GET", "/fapi/v2/positionRisk", q);
   if (!Array.isArray(data)) throw new Error("查询持仓失败");
   for (const p of data){
     const amt = parseFloat(p.positionAmt) || 0;
