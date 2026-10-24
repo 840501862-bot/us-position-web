@@ -583,6 +583,37 @@ async function getRules(){
 async function apiPost(acct, query){
   return signedFetch(acct, "POST", "/fapi/v1/order", query);
 }
+
+/* ============ 持仓模式（单向/双向）与 positionSide 自动适配 ============
+   双向持仓(Hedge)：positionSide 必须显式传 LONG/SHORT，否则报 -4061
+   单向持仓(One-way)：positionSide 必须为 BOTH（或不传），传 LONG/SHORT 反而报 -4061 */
+const dualCache = new Map();   // api_key -> {dual:bool, t:number}
+async function getDualSide(acct, force){
+  const hit = dualCache.get(acct.api_key);
+  if (!force && hit && Date.now() - hit.t < 3600*1000) return hit.dual;
+  const data = await apiGet(acct, "/fapi/v2/account");
+  const d = !!(data && data.dualSidePosition);
+  dualCache.set(acct.api_key, {dual: d, t: Date.now()});
+  return d;
+}
+// dir: "long" / "short"（要建立/加仓的仓位方向）；单向模式一律 BOTH
+function posSideOf(dual, dir){ return dual ? (dir === "long" ? "LONG" : "SHORT") : "BOTH"; }
+// 下单：自动带 positionSide；若 -4061 说明模式判断有偏差，强制重查账户模式后换一个 positionSide 重试一次
+// baseQuery 里不要带 recvWindow/timestamp，由本函数统一追加
+async function postOrderAuto(acct, baseQuery, dir){
+  let dual = await getDualSide(acct, false);
+  const tryOnce = async (ds) => {
+    const q = baseQuery + "&positionSide=" + posSideOf(ds, dir) +
+      "&recvWindow=10000&timestamp=" + (await nowMs());
+    return await apiPost(acct, q);
+  };
+  let data = await tryOnce(dual);
+  if (data && data.code === -4061){
+    dual = await getDualSide(acct, true);        // 强制重查账户实际持仓模式
+    data = await tryOnce(dual);                  // 换 positionSide 再发一次
+  }
+  return data;
+}
 async function openPos(sym, dir){
   const msg = document.getElementById("p3msg");
   const btn = document.querySelector('#p3body button[data-open="' + sym + "|" + dir + '"]');
@@ -601,8 +632,9 @@ async function openPos(sym, dir){
     const qty = calcAddQty(price, rule);
     const actual = qty * price;
     const side = dir === "多" ? "BUY" : "SELL";
-    const query = "symbol=" + sym + "&side=" + side + "&type=MARKET&quantity=" + qty + "&newOrderRespType=ACK&recvWindow=10000&timestamp=" + (await nowMs());
-    const data = await apiPost(acct, query);
+    const wantDir = dir === "多" ? "long" : "short";
+    const baseQ = "symbol=" + sym + "&side=" + side + "&type=MARKET&quantity=" + qty + "&newOrderRespType=ACK";
+    const data = await postOrderAuto(acct, baseQ, wantDir);
     if (data && data.code !== undefined){
       throw new Error("code " + data.code + ": " + (data.msg||""));
     }
@@ -677,9 +709,10 @@ async function setStopLoss(acct, sym, pos){
   const half = pos.unrealized * 0.5 / amtAbs;
   const stopPrice = pos.amt > 0 ? pos.mark - half : pos.mark + half;
   const side = pos.amt > 0 ? "SELL" : "BUY";
-  const query = "symbol=" + sym + "&side=" + side + "&type=STOP_MARKET&stopPrice=" + stopPrice +
-    "&closePosition=true&workingType=MARK_PRICE&timeInForce=GTC&newOrderRespType=ACK&recvWindow=10000&timestamp=" + (await nowMs());
-  const data = await apiPost(acct, query);
+  const wantDir = pos.amt > 0 ? "long" : "short";   // 平多止损对应 LONG 仓位，平空对应 SHORT
+  const baseQ = "symbol=" + sym + "&side=" + side + "&type=STOP_MARKET&stopPrice=" + stopPrice +
+    "&closePosition=true&workingType=MARK_PRICE&newOrderRespType=ACK";
+  const data = await postOrderAuto(acct, baseQ, wantDir);
   if (data && data.code !== undefined) throw new Error("设止损失败 code " + data.code + ": " + (data.msg||""));
   return stopPrice;
 }
@@ -706,8 +739,9 @@ async function addPos(sym, acctIdx, setSL){
       if (pre.roi < 100) throw new Error("投资回报率小于100%");
     }
     const side = cur.amt > 0 ? "BUY" : "SELL";
-    const query = "symbol=" + sym + "&side=" + side + "&type=MARKET&quantity=" + qty + "&newOrderRespType=ACK&recvWindow=10000&timestamp=" + (await nowMs());
-    const data = await apiPost(acct, query);
+    const wantDir = cur.amt > 0 ? "long" : "short";
+    const baseQ = "symbol=" + sym + "&side=" + side + "&type=MARKET&quantity=" + qty + "&newOrderRespType=ACK";
+    const data = await postOrderAuto(acct, baseQ, wantDir);
     if (data && data.code !== undefined) throw new Error("加仓失败 code " + data.code + ": " + (data.msg||""));
     let slTxt = "";
     if (setSL){
