@@ -460,7 +460,7 @@ function cellHtml(r, grp){
     '<td class="num">' + fmtQtyUsd(r.notional) + '</td>' +
     '<td class="num ' + pnlCls + '">' + fmtUsd(r.unrealized) + '</td>' +
     '<td class="num ' + roiCls + '">' + fmtRoi(r.roi) + '</td>' +
-    '<td><button class="btn-add" data-add="' + r.symbol + "|" + r.acctIdx + '">加仓</button></td></tr>';
+    '<td><button class="btn-add" data-add="' + r.symbol + "|" + r.acctIdx + "|" + (r.amt > 0 ? "long" : "short") + '">加仓</button></td></tr>';
 }
 
 function render(){
@@ -661,15 +661,17 @@ function calcAddQty(price, rule){
   return qty;
 }
 // 取当前持仓（含回报率，加仓前核对 / 加仓后用于设止损）
-async function getPosition(acct, sym){
+// dir: "long"/"short"，按方向精确取仓（双向持仓下同币有多空两行）
+async function getPosition(acct, sym, dir){
   const data = await apiGet(acct, "/fapi/v2/positionRisk?symbol=" + sym);
   if (!Array.isArray(data)) throw new Error("查询持仓失败");
   for (const p of data){
     const amt = parseFloat(p.positionAmt) || 0;
-    if (amt !== 0){
-      const info = positionInfo(p);
-      return { amt, mark: info.mark, unrealized: info.unrealized, roi: info.roi };
-    }
+    if (amt === 0) continue;
+    if (dir === "long" && amt <= 0) continue;      // 要多单却遇到空单，跳过
+    if (dir === "short" && amt >= 0) continue;     // 要空单却遇到多单，跳过
+    const info = positionInfo(p);
+    return { amt, mark: info.mark, unrealized: info.unrealized, roi: info.roi };
   }
   return null;
 }
@@ -704,9 +706,9 @@ async function setStopLoss(acct, sym, pos){
   if (data && data.code !== undefined) throw new Error("设止损失败 code " + data.code + ": " + (data.msg||""));
   return stopPrice;
 }
-async function addPos(sym, acctIdx, setSL){
+async function addPos(sym, acctIdx, setSL, dir){
   const msg = document.getElementById(setSL ? "p1msg" : "p2msg");
-  const btn = document.querySelector('#p1body button[data-add="' + sym + "|" + acctIdx + '"], #p2body button[data-add="' + sym + "|" + acctIdx + '"]');
+  const btn = document.querySelector('#p1body button[data-add="' + sym + "|" + acctIdx + "|" + dir + '"], #p2body button[data-add="' + sym + "|" + acctIdx + "|" + dir + '"]');
   if (!btn || btn.disabled) return;
   btn.disabled = true; btn.textContent = "加仓中…";
   try{
@@ -717,23 +719,22 @@ async function addPos(sym, acctIdx, setSL){
     if (!rule || !rule.minNotional) throw new Error("未获取到最小加仓额");
     const price = await getPrice(sym);
     const qty = calcAddQty(price, rule);
-    // 取当前仓位方向
-    const cur = allRows.find(r => r.symbol === sym && r.acctIdx === acctIdx);
-    if (!cur) throw new Error("找不到该持仓");
+    // 按方向取当前仓位记录（双向持仓下同币有多空两行，不能只 find 第一条）
+    const cur = allRows.find(r => r.symbol === sym && r.acctIdx === acctIdx && (dir === "long" ? r.amt > 0 : r.amt < 0));
+    if (!cur) throw new Error("找不到该" + (dir === "long" ? "多" : "空") + "头持仓");
     // 页 1 专属条件：加仓前实时核对回报率 ≥ 100%，回撤到 100% 以下不执行（防波动回撤）
     if (setSL){
-      const pre = await getPosition(acct, sym);
+      const pre = await getPosition(acct, sym, dir);
       if (!pre) throw new Error("查询持仓失败，未执行加仓");
       if (pre.roi < 100) throw new Error("投资回报率小于100%");
     }
-    const side = cur.amt > 0 ? "BUY" : "SELL";
-    const wantDir = cur.amt > 0 ? "long" : "short";
+    const side = dir === "long" ? "BUY" : "SELL";
     const baseQ = "symbol=" + sym + "&side=" + side + "&type=MARKET&quantity=" + qty + "&newOrderRespType=ACK";
-    const data = await postOrderAuto(acct, baseQ, wantDir);
+    const data = await postOrderAuto(acct, baseQ, dir);
     if (data && data.code !== undefined) throw new Error("加仓失败 code " + data.code + ": " + (data.msg||""));
     let slTxt = "";
     if (setSL){
-      const pos = await getPosition(acct, sym);
+      const pos = await getPosition(acct, sym, dir);
       if (!pos) throw new Error("加仓成功但查询持仓失败（跳过止损）");
       const canceled = await cancelPosSL(acct, sym);
       const stopPrice = await setStopLoss(acct, sym, pos);
@@ -829,13 +830,13 @@ document.getElementById("p1body").addEventListener("click", e => {
   const b = e.target.closest("button[data-add]");
   if (!b) return;
   const parts = b.dataset.add.split("|");
-  addPos(parts[0], parseInt(parts[1],10), true);   // 页 1：加仓 + 设止损
+  addPos(parts[0], parseInt(parts[1],10), true, parts[2]);   // 页 1：加仓 + 设止损
 });
 document.getElementById("p2body").addEventListener("click", e => {
   const b = e.target.closest("button[data-add]");
   if (!b) return;
   const parts = b.dataset.add.split("|");
-  addPos(parts[0], parseInt(parts[1],10), false);  // 页 2：只加仓
+  addPos(parts[0], parseInt(parts[1],10), false, parts[2]);  // 页 2：只加仓
 });
 
 /* ================= 启动 ================= */
