@@ -143,7 +143,7 @@
 </header>
 
 <nav class="tabs">
-  <button class="active" data-page="p1">页 1 · 盈利榜（回报率 ≥ 100%）</button>
+  <button class="active" data-page="p1">页 1 · 盈利榜（回报率 ≥ 50%）</button>
   <button data-page="p2">页 2 · 双亏监控（多空都亏超 -100%）</button>
   <button data-page="p3">页 3 · 开仓（缺方向交易对）</button>
 </nav>
@@ -152,7 +152,7 @@
   <section class="panel active" id="p1">
     <div class="page-head">
       <h2>高回报率持仓</h2>
-      <span class="hint">投资回报率 ≥ 100% 的持仓（多单/空单都统计）</span>
+      <span class="hint">投资回报率 ≥ 50% 的持仓（多单/空单都统计）</span>
       <span class="count" id="p1count"></span>
     </div>
     <div class="pmsg" id="p1msg"></div>
@@ -467,12 +467,12 @@ function render(){
   const SEL = getSelAcct();
   const viewRows = SEL >= 0 ? allRows.filter(r => r.acctIdx === SEL) : [];
 
-  // ---- 页 1：回报率 ≥ 100% ----
-  const p1 = viewRows.filter(r => r.roi >= 100).sort((a,b) => b.roi - a.roi);
+  // ---- 页 1：回报率 ≥ 50% ----
+  const p1 = viewRows.filter(r => r.roi >= 50).sort((a,b) => b.roi - a.roi);
   document.getElementById("p1count").textContent = p1.length ? "共 " + p1.length + " 条" : "";
   document.getElementById("p1body").innerHTML = p1.length
     ? p1.map(r => cellHtml(r, false)).join("")
-    : emptyRow("当前没有回报率 ≥ 100% 的持仓", 6);
+    : emptyRow("当前没有回报率 ≥ 50% 的持仓", 6);
 
   // ---- 页 2：同币多空对冲（不同账户同一币种同时持多+空，两边都未爆仓 roi > -100）----
   const bySym = {};
@@ -730,11 +730,11 @@ async function addPos(sym, acctIdx, setSL, dir){
     const curQty = Math.abs(cur.amt);
     const qty = calcAddQty(price, rule, curQty);
     const equalAdd = curQty * price >= rule.minNotional;   // 是否走了等量加仓
-    // 页 1 专属条件：加仓前实时核对回报率 ≥ 100%，回撤到 100% 以下不执行（防波动回撤）
+    // 页 1 专属条件：加仓前实时核对回报率 ≥ 50%，回撤到 50% 以下不执行（防波动回撤）
     if (setSL){
       const pre = await getPosition(acct, sym, dir);
       if (!pre) throw new Error("查询持仓失败，未执行加仓");
-      if (pre.roi < 100) throw new Error("投资回报率小于100%");
+      if (pre.roi < 50) throw new Error("投资回报率小于50%");
     }
     const side = dir === "long" ? "BUY" : "SELL";
     const baseQ = "symbol=" + sym + "&side=" + side + "&type=MARKET&quantity=" + qty + "&newOrderRespType=ACK";
