@@ -584,35 +584,23 @@ async function apiPost(acct, query){
   return signedFetch(acct, "POST", "/fapi/v1/order", query);
 }
 
-/* ============ 持仓模式（单向/双向）与 positionSide 自动适配 ============
-   双向持仓(Hedge)：positionSide 必须显式传 LONG/SHORT，否则报 -4061
-   单向持仓(One-way)：positionSide 必须为 BOTH（或不传），传 LONG/SHORT 反而报 -4061 */
-const dualCache = new Map();   // api_key -> {dual:bool, t:number}
-async function getDualSide(acct, force){
-  const hit = dualCache.get(acct.api_key);
-  if (!force && hit && Date.now() - hit.t < 3600*1000) return hit.dual;
-  const data = await apiGet(acct, "/fapi/v2/account");
-  const d = !!(data && data.dualSidePosition);
-  dualCache.set(acct.api_key, {dual: d, t: Date.now()});
-  return d;
-}
-// dir: "long" / "short"（要建立/加仓的仓位方向）；单向模式一律 BOTH
-function posSideOf(dual, dir){ return dual ? (dir === "long" ? "LONG" : "SHORT") : "BOTH"; }
-// 下单：自动带 positionSide；若 -4061 说明模式判断有偏差，强制重查账户模式后换一个 positionSide 重试一次
-// baseQuery 里不要带 recvWindow/timestamp，由本函数统一追加
+/* ============ positionSide 自动适配 ============
+   双向持仓(Hedge)：positionSide 必须传 LONG/SHORT，传 BOTH 报 -4061
+   单向持仓(One-way)：positionSide 必须为 BOTH，传 LONG/SHORT 报 -4061
+   策略：直接按方向依次尝试候选 positionSide，遇到 -4061 自动换下一个，
+   完全不依赖 dualSidePosition 查询（避免查询结果与实际不一致导致死循环） */
+// baseQuery 里不要带 recvWindow/timestamp/positionSide，由本函数统一追加
 async function postOrderAuto(acct, baseQuery, dir){
-  let dual = await getDualSide(acct, false);
-  const tryOnce = async (ds) => {
-    const q = baseQuery + "&positionSide=" + posSideOf(ds, dir) +
+  const cands = dir === "long" ? ["LONG", "BOTH"] : ["SHORT", "BOTH"];
+  let lastData = null;
+  for (const ps of cands){
+    const q = baseQuery + "&positionSide=" + ps +
       "&recvWindow=10000&timestamp=" + (await nowMs());
-    return await apiPost(acct, q);
-  };
-  let data = await tryOnce(dual);
-  if (data && data.code === -4061){
-    dual = await getDualSide(acct, true);        // 强制重查账户实际持仓模式
-    data = await tryOnce(dual);                  // 换 positionSide 再发一次
+    const data = await apiPost(acct, q);
+    if (!(data && data.code === -4061)) return data;   // 成功或其他错误直接返回
+    lastData = data;                                     // -4061 换下一个 positionSide 再试
   }
-  return data;
+  return lastData;                                       // 两个都 -4061，返回最后一个错误
 }
 async function openPos(sym, dir){
   const msg = document.getElementById("p3msg");
