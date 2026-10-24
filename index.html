@@ -648,10 +648,17 @@ async function getPrice(sym){
   if (!p) throw new Error("获取当前价格失败");
   return p;
 }
-function calcAddQty(price, rule){
+// 加仓数量：默认 = 当前持仓数量（等量加仓，仓位翻倍）；
+// 若不传 currentQty（页3新开仓），或当前仓位金额 < minNotional，则按 minNotional + 1
+function calcAddQty(price, rule, currentQty){
   const minN = rule.minNotional;
-  const target = minN + 1;
-  let qty = Math.floor((target / price) / rule.step) * rule.step;
+  let qty;
+  if (currentQty && currentQty * price >= minN){
+    qty = Math.floor(currentQty / rule.step) * rule.step;      // 等量加仓
+  } else {
+    const target = minN + 1;
+    qty = Math.floor((target / price) / rule.step) * rule.step; // 最小开仓 + 1
+  }
   qty = Math.round(qty * 1e8) / 1e8;
   if (qty * price < minN){
     qty = Math.ceil((minN / price) / rule.step) * rule.step;
@@ -717,11 +724,13 @@ async function addPos(sym, acctIdx, setSL, dir){
     if (!acct) throw new Error("账户不存在");
     const rule = (await getRules())[sym];
     if (!rule || !rule.minNotional) throw new Error("未获取到最小加仓额");
-    const price = await getPrice(sym);
-    const qty = calcAddQty(price, rule);
     // 按方向取当前仓位记录（双向持仓下同币有多空两行，不能只 find 第一条）
     const cur = allRows.find(r => r.symbol === sym && r.acctIdx === acctIdx && (dir === "long" ? r.amt > 0 : r.amt < 0));
     if (!cur) throw new Error("找不到该" + (dir === "long" ? "多" : "空") + "头持仓");
+    const price = await getPrice(sym);
+    const curQty = Math.abs(cur.amt);
+    const qty = calcAddQty(price, rule, curQty);
+    const equalAdd = curQty * price >= rule.minNotional;   // 是否走了等量加仓
     // 页 1 专属条件：加仓前实时核对回报率 ≥ 100%，回撤到 100% 以下不执行（防波动回撤）
     if (setSL){
       const pre = await getPosition(acct, sym, dir);
@@ -741,8 +750,11 @@ async function addPos(sym, acctIdx, setSL, dir){
       slTxt = " · 已取消旧止损 " + canceled + " 单 · 新止损 " + stopPrice.toFixed(4) +
         "（浮盈 " + fmtUsd(pos.unrealized) + " 回撤 50% 即 " + fmtUsd(pos.unrealized * 0.5) + " 触发）";
     }
+    const qtyNote = equalAdd
+      ? "（等量加仓，与当前持仓 " + fmtQtyUsd(cur.notional) + " 相同，仓位翻倍）"
+      : "（当前仓位 " + fmtQtyUsd(cur.notional) + " 不足最小开仓 " + rule.minNotional.toFixed(2) + " USDT，按最小 + 1）";
     msg.className = "pmsg ok";
-    msg.textContent = sym + " 加仓成功 · " + side + " " + qty + "（金额约 " + (qty * price).toFixed(2) + " USDT，最小 " + rule.minNotional.toFixed(2) + " + 1）" + slTxt;
+    msg.textContent = sym + " 加仓成功 · " + side + " " + qty + "（金额约 " + (qty * price).toFixed(2) + " USDT，" + qtyNote + "）" + slTxt;
   }catch(e){
     msg.className = "pmsg err";
     msg.textContent = sym + " 加仓失败：" + e.message;
