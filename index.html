@@ -159,7 +159,7 @@
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>交易对名称</th><th>账户</th><th>方向</th><th>持仓数量(USDT)</th><th>未实现盈亏</th><th>投资回报率</th><th>加仓操作</th>
+          <th>交易对名称</th><th>账户</th><th>方向</th><th>持仓数量(USDT)</th><th>投资回报率</th><th>加仓操作</th>
         </tr></thead>
         <tbody id="p1body"></tbody>
       </table>
@@ -176,7 +176,7 @@
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>交易对名称</th><th>账户</th><th>方向</th><th>持仓数量(USDT)</th><th>未实现盈亏</th><th>投资回报率</th><th>加仓操作</th>
+          <th>交易对名称</th><th>账户</th><th>方向</th><th>持仓数量(USDT)</th><th>投资回报率</th><th>加仓操作</th>
         </tr></thead>
         <tbody id="p2body"></tbody>
       </table>
@@ -458,7 +458,6 @@ function cellHtml(r, grp){
     '<td class="acct">' + r.acct + '</td>' +
     '<td class="' + sideCls + '">' + sideTxt + '</td>' +
     '<td class="num">' + fmtQtyUsd(r.notional) + '</td>' +
-    '<td class="num ' + pnlCls + '">' + fmtUsd(r.unrealized) + '</td>' +
     '<td class="num ' + roiCls + '">' + fmtRoi(r.roi) + '</td>' +
     '<td><button class="btn-add" data-add="' + r.symbol + "|" + r.acctIdx + "|" + (r.amt > 0 ? "long" : "short") + '">加仓</button></td></tr>';
 }
@@ -473,7 +472,7 @@ function render(){
   document.getElementById("p1count").textContent = p1.length ? "共 " + p1.length + " 条" : "";
   document.getElementById("p1body").innerHTML = p1.length
     ? p1.map(r => cellHtml(r, false)).join("")
-    : emptyRow("当前没有回报率 ≥ 100% 的持仓", 7);
+    : emptyRow("当前没有回报率 ≥ 100% 的持仓", 6);
 
   // ---- 页 2：同币多空对冲（不同账户同一币种同时持多+空，两边都未爆仓 roi > -100）----
   const bySym = {};
@@ -497,14 +496,14 @@ function render(){
     let last = "", grpFlip = false, html = "";
     for (const r of p2){
       if (r.symbol !== last){
-        if (last !== "") html += '<tr class="grp-gap"><td colspan="7"></td></tr>';
+        if (last !== "") html += '<tr class="grp-gap"><td colspan="6"></td></tr>';
         grpFlip = !grpFlip; last = r.symbol;
       }
       html += cellHtml(r, grpFlip);
     }
     document.getElementById("p2body").innerHTML = html;
   } else {
-    document.getElementById("p2body").innerHTML = emptyRow("当前没有「多空两边都亏超 -100%」的同币持仓", 7);
+    document.getElementById("p2body").innerHTML = emptyRow("当前没有「多空两边都亏超 -100%」的同币持仓", 6);
   }
 
   // ---- 页 3：开仓（缺失的多空方向）----
@@ -854,8 +853,8 @@ document.getElementById("p2body").addEventListener("click", e => {
 /* ================= 启动 ================= */
 loadOpened();
 rebuildAcctSelect();
-document.getElementById("p1body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 7);
-document.getElementById("p2body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 7);
+document.getElementById("p1body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 6);
+document.getElementById("p2body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 6);
 document.getElementById("p3body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 3);
 if (loadKeys().some(k => k && k.api_key && k.api_secret)) refresh();
 </script>
