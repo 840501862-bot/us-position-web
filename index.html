@@ -727,7 +727,7 @@ async function setStopLoss(acct, acctIdx, sym, pos, dir){
   for (const ps of cands){
     const q = "algoType=CONDITIONAL&symbol=" + sym + "&side=" + side +
       "&type=STOP_MARKET&triggerPrice=" + stopPrice.toFixed(6) +
-      "&closePosition=true&workingType=MARK_PRICE&positionSide=" + ps +
+      "&closePosition=true&positionSide=" + ps +
       "&clientAlgoId=" + clientAlgoId +
       "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
     data = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
@@ -772,6 +772,7 @@ async function addPos(sym, acctIdx, setSL, dir){
     if (data && data.code !== undefined) throw new Error("加仓失败 code " + data.code + ": " + (data.msg||""));
     let slTxt = "";
     if (setSL){
+      await new Promise(r => setTimeout(r, 500));   // 等市价单成交反映到仓位
       const pos = await getPosition(acct, sym, dir);
       if (!pos) throw new Error("加仓成功但查询持仓失败（跳过止损）");
       const canceled = await cancelPosSL(acct, acctIdx, sym, dir);
