@@ -186,7 +186,7 @@
   <section class="panel" id="p3">
     <div class="page-head">
       <h2>缺方向交易对（开仓）</h2>
-      <span class="hint">按缺失的多空方向列出：缺多单 → 显示「多」；缺空单 → 显示「空」；无任何持仓 → 同时显示「多」「空」两行。点「开仓」：按系统最小开仓额 + 1 USDT 市价开仓（用标题旁下拉选择的账户），成功后按钮禁用防重复</span>
+      <span class="hint">按缺失的多空方向列出：缺多单 → 显示「多」；缺空单 → 显示「空」；无任何持仓 → 同时显示「多」「空」两行。点「开仓」：按系统最小开仓额 + 1 USDT 市价开仓（用标题旁下拉选择的账户），开仓成功后冷却 1 分钟，冷却结束可再次开仓</span>
       <span class="count" id="p3count"></span>
     </div>
     <div class="pmsg" id="p3msg"></div>
@@ -529,12 +529,15 @@ function render(){
 
 /* ================= 开仓（页 3） ================= */
 const OPENED_KEY = "us_opened_v1";
+const COOLDOWN_MS = 60*1000;   // 开仓后冷却 1 分钟，冷却结束可再次开仓
 let OPENED = {};
 function loadOpened(){
   try{
     const arr = JSON.parse(localStorage.getItem(OPENED_KEY)||"[]");
     OPENED = {};
-    for (const o of arr) OPENED[o.sym + ":" + o.dir] = o;
+    for (const o of arr){
+      if (Date.now() - o.t < COOLDOWN_MS) OPENED[o.sym + ":" + o.dir] = o;  // 只保留冷却期内的记录
+    }
   }catch(e){ OPENED = {}; }
   return OPENED;
 }
@@ -549,8 +552,29 @@ function fmtTime(ms){
 function btnOpenHtml(sym, dir){
   const key = sym + ":" + dir;
   const done = OPENED[key];
-  if (done) return '<button class="btn-open" disabled>已开仓 ' + fmtTime(done.t) + '</button>';
+  const remain = done ? Math.ceil((COOLDOWN_MS - (Date.now() - done.t)) / 1000) : 0;
+  if (remain > 0){
+    return '<button class="btn-open" disabled data-open-key="' + sym + "|" + dir + '">已开仓 ' + fmtTime(done.t) + ' · 冷却 ' + remain + 's</button>';
+  }
   return '<button class="btn-open" data-open="' + sym + "|" + dir + '">开仓</button>';
+}
+/* 开仓冷却计时器：每秒更新剩余秒数，冷却结束自动恢复为可再次开仓 */
+function tickCooldown(){
+  const now = Date.now();
+  document.querySelectorAll("#p3body button[data-open-key]").forEach(btn => {
+    const [sym, dir] = btn.dataset.openKey.split("|");
+    const done = OPENED[sym + ":" + dir];
+    const remain = done ? Math.ceil((COOLDOWN_MS - (now - done.t)) / 1000) : 0;
+    if (remain > 0){
+      btn.textContent = "已开仓 " + fmtTime(done.t) + " · 冷却 " + remain + "s";
+      return;
+    }
+    // 冷却结束：恢复为可再次开仓
+    btn.removeAttribute("data-open-key");
+    btn.disabled = false;
+    btn.textContent = "开仓";
+    btn.setAttribute("data-open", sym + "|" + dir);
+  });
 }
 const RULES_KEY = "us_rules_v3";
 let rulesCache = null;
@@ -628,7 +652,10 @@ async function openPos(sym, dir){
     }
     OPENED[sym + ":" + dir] = {sym, dir, t:Date.now()};
     saveOpened();
-    btn.disabled = true; btn.textContent = "已开仓 " + fmtTime(OPENED[sym + ":" + dir].t);
+    btn.setAttribute("data-open-key", sym + "|" + dir);
+    btn.removeAttribute("data-open");
+    btn.disabled = true;
+    btn.textContent = "已开仓 " + fmtTime(OPENED[sym + ":" + dir].t) + " · 冷却 60s";
     msg.className = "pmsg ok";
     msg.textContent = sym + " " + side + " 市价开仓成功 · 金额约 " + actual.toFixed(2) + " USDT（系统最小 " + minN.toFixed(2) + " + 1）· 数量 " + qty;
   }catch(e){
@@ -887,6 +914,7 @@ document.getElementById("p2body").addEventListener("click", e => {
 
 /* ================= 启动 ================= */
 loadOpened();
+setInterval(tickCooldown, 1000);   // 开仓冷却倒计时
 rebuildAcctSelect();
 document.getElementById("p1body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 6);
 document.getElementById("p2body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 6);
