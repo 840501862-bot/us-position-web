@@ -719,59 +719,190 @@ function newClientAlgoId(){
     .map(b => b.toString(16).padStart(2,"0")).join("");
   return ("SL"+hex).toUpperCase().slice(0,32);
 }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// 查询交易对未成交的算法单（服务端止损扫描/校验用）
+async function listOpenAlgo(acct, sym){
+  const q = "symbol=" + sym + "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
+  const d = await signedFetch(acct, "GET", "/fapi/v1/algoOrder", q);
+  return Array.isArray(d) ? d : [];
+}
+/* 市价加仓（带网络自愈）：请求超时/网络错误时先查持仓确认是否已成交，
+   成交了就视为成功（不重复下），没成交才重试；限流/繁忙则退避后重试 */
+async function postOrderAutoRobust(acct, sym, dir, qty, preAmt){
+  const baseQuery = "symbol=" + sym + "&side=" + (dir === "long" ? "BUY" : "SELL") +
+    "&type=MARKET&quantity=" + qty + "&newOrderRespType=ACK";
+  for (let attempt=0; attempt<4; attempt++){
+    let data=null, netErr=null;
+    try{ data = await postOrderAuto(acct, baseQuery, dir); }catch(e){ netErr=e; }
+    if (data && data.code !== undefined){
+      if (data.code === -1003 || data.code === -1015 || data.code === -1004){
+        await sleep(1500 * (attempt + 1)); continue;      // 限流/服务繁忙 → 退避重试
+      }
+      if (data.code === -1021){ await forceResync(); await sleep(500); continue; }
+      throw new Error("加仓失败 code " + data.code + ": " + (data.msg || ""));
+    }
+    if (netErr){
+      // 网络/超时：无法确认是否成交 → 查持仓确认，避免重复加仓或漏加
+      await sleep(1000);
+      let posNow = null;
+      try{ posNow = await getPosition(acct, sym, dir); }catch(e){}
+      if (posNow && Math.abs(posNow.amt) >= Math.abs(preAmt) + Math.abs(qty) * 0.5){
+        return {filled:true, acked:false};                 // 其实已成交
+      }
+      await sleep(1000);
+      continue;
+    }
+    return {filled:true, acked:true};                      // 服务端已确认成交
+  }
+  throw new Error("加仓请求多次网络超时且无法确认是否成交——请立即在币安确认仓位，若已加仓请手动补设止损");
+}
 // 撤算法止损单（按 clientAlgoId）
 async function cancelAlgo(acct, clientAlgoId){
   const q = "clientAlgoId=" + clientAlgoId + "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
   return await signedFetch(acct, "DELETE", "/fapi/v1/algoOrder", q);
 }
-// 撤掉该账户该币该方向的旧算法止损单（按本地跟踪表）
+// 撤掉该账户该币该方向的旧算法止损单：
+// 1) 服务端扫描 + 校验：撤掉该交易对同方向上所有平仓止损条件单
+//    （覆盖 STOP_MARKET 与 TRAILING_STOP_MARKET），最多 4 轮，每轮撤销后重新
+//    查询校验，列表查询失败（网络抖动）会重试，确保旧止损真正被撤干净，
+//    新止损才不会被币安「同方向只允许一个 closePosition 条件单」(-4130) 拒绝；
+// 2) 本地跟踪表兜底（服务端扫描失败或订单未在列表中时）
 async function cancelPosSL(acct, acctIdx, sym, dir){
   const all = loadSLTracking();
-  const kept = [], canceled = [];
+  const wantSide = dir === "long" ? "SELL" : "BUY";
+  const removed = [];
+  const matches = o => {
+    const type = String(o.type || "");
+    if (type !== "STOP_MARKET" && type !== "TRAILING_STOP_MARKET") return false;
+    if (String(o.side) !== wantSide) return false;
+    const isClose = String(o.closePosition) === "true" ||
+                    (o.closePosition === undefined && String(o.reduceOnly) === "true");
+    return isClose;
+  };
+  let n = 0;
+  for (let round=0; round<4; round++){
+    let open = [];
+    let listOk = false;
+    for (let listTry=0; listTry<3; listTry++){
+      try{ open = await listOpenAlgo(acct, sym); listOk = true; break; }catch(e){
+        await sleep(700 * (listTry + 1));
+      }
+    }
+    if (!listOk){ await sleep(800); continue; }        // 列表都查不到，下一轮再试
+    const targets = open.filter(matches);
+    if (!targets.length) break;                        // 已清空
+    let roundHit = false;
+    for (const o of targets){
+      try{
+        await cancelAlgo(acct, o.clientAlgoId);
+        n++; roundHit = true;
+        if (o.clientAlgoId) removed.push(o.clientAlgoId);
+      }catch(e){}
+    }
+    if (!roundHit) await sleep(600);
+    await sleep(400);
+  }
+  // 本地跟踪表兜底（服务端扫描失败或订单未在列表中时）
+  const kept = [];
   for (const o of all){
     if (o.acctIdx === acctIdx && o.symbol === sym && o.dir === dir){
-      try{ await cancelAlgo(acct, o.clientAlgoId); canceled.push(o.clientAlgoId); }
-      catch(e){ kept.push(o); }   // 撤失败保留，下次再试
+      if (removed.indexOf(o.clientAlgoId) >= 0) continue;
+      try{ await cancelAlgo(acct, o.clientAlgoId); n++; }catch(e){ kept.push(o); }
     } else kept.push(o);
   }
   saveSLTracking(kept);
-  return canceled.length;
+  return n;
 }
 // 设置仓位止损：浮盈回撤 50% 时触发（浮盈 5U → 回撤到剩 2.5U 对应价格）
 // 走 Algo Order API（/fapi/v1/algoOrder），closePosition=true 的仓位级止损必须走这个接口
+// 【稳定性保障】最多重试 8 次、退避递增：
+//  - 网络超时/错误：先查服务端该止损是否其实已挂上（有则视为成功），没有才重试
+//  - 限流/繁忙(-1003/-1015/-1004)：等待后重试
+//  - -2021/-4004（触发价距现价过近会立即触发）：把触发价推远 0.5% 重试
+//    （推远后不许越过入场价：多单不低于入场价×1.001、空单不高于入场价×0.999，杜绝“触发即亏损”）
+//  - -4130（同方向已存在 closePosition 条件单）：先强制撤干净旧止损并校验，再原地重试
+//  - 其余错误：退避后重试
 async function setStopLoss(acct, acctIdx, sym, pos, dir){
   const amtAbs = Math.abs(pos.amt);
   if (!(pos.unrealized > 0) || amtAbs <= 0){
     throw new Error("当前无浮盈，跳过止损设置");
   }
   const half = pos.unrealized * 0.5 / amtAbs;
-  const stopPrice = pos.amt > 0 ? pos.mark - half : pos.mark + half;
+  let stopPrice = pos.amt > 0 ? pos.mark - half : pos.mark + half;
   const side = pos.amt > 0 ? "SELL" : "BUY";
   const wantDir = pos.amt > 0 ? "long" : "short";
-  const clientAlgoId = newClientAlgoId();
   const rule = (await getRules())[sym] || {};
   const pp = rule.pricePrec || 2;
-  const triggerPrice = stopPrice.toFixed(pp);
   // positionSide 候选：双向 LONG/SHORT，单向 BOTH
   const cands = wantDir === "long" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
-  let data = null, lastErr = null;
-  for (const ps of cands){
-    const q = "algoType=CONDITIONAL&symbol=" + sym + "&side=" + side +
-      "&type=STOP_MARKET&triggerPrice=" + triggerPrice +
-      "&closePosition=true&positionSide=" + ps +
-      "&clientAlgoId=" + clientAlgoId +
-      "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
-    data = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
-    if (!(data && data.code === -4061)) break;   // -4061 换 positionSide 重试
-    lastErr = data;
+  const BACKOFF = [600, 1000, 1500, 2500, 3500, 5000, 5000];
+  let lastErr = null;
+  for (let attempt=0; attempt<8; attempt++){
+    const clientAlgoId = newClientAlgoId();
+    const triggerPrice = stopPrice.toFixed(pp);
+    let outcome = "error";                             // "placed" | "error"
+    for (const ps of cands){
+      let data = null, netErr = null;
+      try{
+        const q = "algoType=CONDITIONAL&symbol=" + sym + "&side=" + side +
+          "&type=STOP_MARKET&triggerPrice=" + triggerPrice +
+          "&closePosition=true&positionSide=" + ps +
+          "&clientAlgoId=" + clientAlgoId +
+          "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
+        data = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
+      }catch(e){ netErr = e; }
+      if (netErr){
+        lastErr = netErr;
+        await sleep(800);
+        try{
+          const open = await listOpenAlgo(acct, sym);
+          if (open.find(o => String(o.clientAlgoId) === clientAlgoId ||
+             (String(o.type) === "STOP_MARKET" && String(o.side) === side && String(o.closePosition) === "true"))){
+            outcome = "placed";                        // 超时但其实已挂上
+          }
+        }catch(e){}
+        break;                                         // 网络错误 → 退避后整轮重试
+      }
+      if (data && data.code !== undefined){
+        lastErr = data;
+        if (data.code === -4061){ continue; }          // 换 positionSide
+        if (data.code === -1021){ await forceResync(); break; }
+        if (data.code === -2021 || data.code === -4004){ // 触发价太近 → 推远 0.5%（不许越过入场价）
+          const buf = pos.mark * 0.005;
+          if (pos.amt > 0){
+            const floor = pos.entry > 0 ? pos.entry * 1.001 : -Infinity;
+            stopPrice = Math.max(pos.mark - buf, floor);
+          } else {
+            const ceil = pos.entry > 0 ? pos.entry * 0.999 : Infinity;
+            stopPrice = Math.min(pos.mark + buf, ceil);
+          }
+          break;
+        }
+        if (data.code === -4130 || /close.?position/i.test(data.msg || "")){
+          // 旧止损没撤干净 → 强制撤干净并校验，再原地重试
+          try{ await cancelPosSL(acct, acctIdx, sym, dir); }catch(e){}
+          await sleep(500);
+          break;
+        }
+        break;                                         // 其他错误（限流/繁忙等）→ 退避重试
+      }
+      outcome = "placed";                              // 服务端已返回成功
+      break;
+    }
+    if (outcome === "placed"){
+      const all = loadSLTracking();
+      all.push({acctIdx, symbol:sym, dir:wantDir, clientAlgoId, triggerPrice:stopPrice,
+                created:new Date().toLocaleString("zh-CN",{hour12:false})});
+      saveSLTracking(all);
+      return stopPrice;
+    }
+    if (attempt < 7) await sleep(BACKOFF[attempt]);
   }
-  if (data && data.code !== undefined) throw new Error("设止损失败 code " + data.code + ": " + (data.msg||""));
-  // 记入本地跟踪表
-  const all = loadSLTracking();
-  all.push({acctIdx, symbol:sym, dir:wantDir, clientAlgoId, triggerPrice:stopPrice,
-            created:new Date().toLocaleString("zh-CN",{hour12:false})});
-  saveSLTracking(all);
-  return stopPrice;
+  if (lastErr){
+    if (lastErr && lastErr.code !== undefined) throw new Error("设止损失败 code " + lastErr.code + ": " + (lastErr.msg || ""));
+    throw new Error("设止损失败：" + ((lastErr && lastErr.message) || "网络错误") + "（已重试8次）");
+  }
+  throw new Error("设止损失败（未知错误）");
 }
 async function addPos(sym, acctIdx, setSL, dir){
   const msg = document.getElementById(setSL ? "p1msg" : "p2msg");
@@ -798,17 +929,36 @@ async function addPos(sym, acctIdx, setSL, dir){
       if (pre.roi < 100) throw new Error("投资回报率小于100%，不满足加仓条件");
     }
     const side = dir === "long" ? "BUY" : "SELL";
-    const baseQ = "symbol=" + sym + "&side=" + side + "&type=MARKET&quantity=" + qty + "&newOrderRespType=ACK";
-    const data = await postOrderAuto(acct, baseQ, dir);
-    if (data && data.code !== undefined) throw new Error("加仓失败 code " + data.code + ": " + (data.msg||""));
+    // 市价加仓（带网络自愈）：超时先查持仓确认是否已成交，避免重复加仓/漏加
+    const filled = await postOrderAutoRobust(acct, sym, dir, qty, Math.abs(cur.amt));
+    if (!filled.filled) throw new Error("加仓未成交（网络异常且持仓无变化）");
     let slTxt = "";
     if (setSL){
-      await new Promise(r => setTimeout(r, 500));   // 等市价单成交反映到仓位
-      const pos = await getPosition(acct, sym, dir);
-      if (!pos) throw new Error("加仓成功但查询持仓失败（跳过止损）");
-      const canceled = await cancelPosSL(acct, acctIdx, sym, dir);
-      const stopPrice = await setStopLoss(acct, acctIdx, sym, pos, dir);
-      slTxt = " · 已取消旧止损 " + canceled + " 单 · 新止损 " + stopPrice.toFixed(4) +
+      // 【核心保障】撤旧止损 → 挂新止损，多轮循环重试直到服务端确认成功；
+      // 加仓已成交，这一步慢也一定要完成（最多 4 轮，每轮内部再各自重试）
+      let pos = null;
+      for (let t=0; t<3 && !pos; t++){
+        try{ pos = await getPosition(acct, sym, dir); }catch(e){}
+        if (!pos) await sleep(800);
+      }
+      if (!pos) throw new Error("加仓已成交，但持仓查询多次失败——请立即手动确认仓位并设置止损");
+      let stopPrice = null, slErr = null;
+      for (let round=0; round<4; round++){
+        try{
+          pos = await getPosition(acct, sym, dir);
+          if (!pos) throw new Error("持仓查询失败");
+          await cancelPosSL(acct, acctIdx, sym, dir);           // 撤旧止损（内部校验，撤干净为止）
+          stopPrice = await setStopLoss(acct, acctIdx, sym, pos, dir);  // 挂新止损（内部再重试8次）
+          break;
+        }catch(e){
+          slErr = e;
+          await sleep([1000, 1500, 2500, 4000][round]);
+        }
+      }
+      if (stopPrice === null){
+        throw new Error("加仓已成交；旧止损已撤销，但新止损多次设置失败（" + ((slErr && slErr.message) || "未知错误") + "）——请立即手动设置止损！");
+      }
+      slTxt = " · 新止损 " + stopPrice.toFixed(rule.pricePrec || 4) +
         "（浮盈 " + fmtUsd(pos.unrealized) + " 回撤 50% 即 " + fmtUsd(pos.unrealized * 0.5) + " 触发）";
     }
     const qtyNote = equalAdd
