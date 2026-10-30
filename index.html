@@ -102,6 +102,18 @@
   .acct { color:var(--sub); font-size:12px; }
   .empty { text-align:center; color:var(--sub); padding:42px 0; font-size:14px; }
   .empty .big { font-size:16px; color:var(--blue2); margin-bottom:6px; }
+  .exec-log {
+    margin:8px 0 10px; max-height:220px; overflow-y:auto;
+    background:rgba(10,14,26,.55); border:1px solid var(--line); border-radius:10px;
+    padding:8px 12px; font-size:12px;
+  }
+  .exec-title { color:var(--sub); margin-bottom:6px; font-size:12px; }
+  .log-line { padding:3px 0; border-bottom:1px dashed rgba(255,255,255,.06); word-break:break-all; line-height:1.5; }
+  .log-line:last-child { border-bottom:none; }
+  .log-ok { color:#22c55e; }
+  .log-err { color:#ef4444; }
+  .log-warn { color:#f5b759; }
+  .log-time { color:var(--sub); margin-right:8px; font-family:Consolas,"Courier New",monospace; }
   .loading-dots::after { content:""; display:inline-block; width:10px; animation:dots 1.2s infinite steps(4); }
   @keyframes dots { 0%{content:""} 25%{content:"·"} 50%{content:"··"} 75%{content:"···"} }
 
@@ -156,6 +168,7 @@
       <span class="count" id="p1count"></span>
     </div>
     <div class="pmsg" id="p1msg"></div>
+    <div class="exec-log" id="p1exec"><div class="exec-title">执行记录（成功/失败各占一行，仅保留最新 5 条）</div></div>
     <div class="tbl-wrap">
       <table>
         <thead><tr>
@@ -290,8 +303,8 @@ document.getElementById("subtitle").textContent =
 const FAPI = "https://fapi.binance.com";
 // 服务器时间同步（60 秒内不重复；performance.now() 做单调时钟；fapi 失败回退 spot 时间源）
 let serverRefMs = 0, serverRefPerf = 0, syncOk = false;
-async function ensureOffset(){
-  if (syncOk && performance.now() - serverRefPerf < 60000) return;
+async function ensureOffset(force){
+  if (!force && syncOk && performance.now() - serverRefPerf < 60000) return;
   const urls = [FAPI + "/fapi/v1/time", "https://api.binance.com/api/v3/time"];
   for (const url of urls){
     try{
@@ -706,11 +719,14 @@ async function getPosition(acct, sym, dir){
     if (dir === "long" && amt <= 0) continue;      // 要多单却遇到空单，跳过
     if (dir === "short" && amt >= 0) continue;     // 要空单却遇到多单，跳过
     const info = positionInfo(p);
-    return { amt, mark: info.mark, unrealized: info.unrealized, roi: info.roi };
+    return { amt, mark: info.mark, unrealized: info.unrealized, roi: info.roi, entry: info.entry };
   }
   return null;
 }
-// 本地跟踪已挂的算法止损单：{acctIdx, symbol, dir, clientAlgoId, triggerPrice, created}
+/* ============ 止损单本地跟踪 + 断点续跑（页1 加仓止损保障） ============ */
+// 本地跟踪已挂的止损单：普通单记录 {symbol, dir, orderId, clientOrderId, triggerPrice, created}
+//                      算法单记录 {symbol, dir, clientAlgoId, triggerPrice, created}
+// （历史记录可能含 acctIdx 字段，匹配时忽略，按 symbol+dir 为准）
 const SL_STORE = "us_sl_v1";
 function loadSLTracking(){ try{ const a = JSON.parse(localStorage.getItem(SL_STORE)||"[]"); return Array.isArray(a)?a:[]; }catch(e){ return []; } }
 function saveSLTracking(a){ try{ localStorage.setItem(SL_STORE, JSON.stringify(a)); }catch(e){} }
@@ -720,11 +736,112 @@ function newClientAlgoId(){
   return ("SL"+hex).toUpperCase().slice(0,32);
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-// 查询交易对未成交的算法单（服务端止损扫描/校验用）
-async function listOpenAlgo(acct, sym){
-  const q = "symbol=" + sym + "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
-  const d = await signedFetch(acct, "GET", "/fapi/v1/algoOrder", q);
+
+/* 止损断点续跑：加仓成交后、止损完成前把任务记录到本地。
+   手机端切后台/锁屏/页面被杀导致止损中断时，重开页面会自动补设止损，
+   保证“加完仓设止损”最终一定成功。 */
+const PEND_KEY = "us_sl_pending_v1";
+const PEND_TTL = 30*60*1000;   // 待办任务最长保留 30 分钟：超过视为过期（可能已手动处理/仓位已平），自动丢弃
+function loadPending(){
+  try{
+    const list = JSON.parse(localStorage.getItem(PEND_KEY)||"[]");
+    const now = Date.now();
+    const fresh = list.filter(x=> now-(x.ts||0) <= PEND_TTL);
+    if(fresh.length!==list.length){
+      try{ localStorage.setItem(PEND_KEY, JSON.stringify(fresh)); }catch(e){}
+    }
+    return fresh;
+  }catch(e){ return []; }
+}
+function savePending(list){ try{ localStorage.setItem(PEND_KEY, JSON.stringify(list)); }catch(e){} }
+function upsertPending(t){
+  const list = loadPending().filter(x=>!(x.acctIdx===t.acctIdx && x.sym===t.sym && x.dir===t.dir));
+  list.push(t);
+  savePending(list);
+}
+function clearPending(acctIdx, sym, dir){
+  savePending(loadPending().filter(x=>!(x.acctIdx===acctIdx && x.sym===sym && x.dir===dir)));
+}
+
+/* ============ 持仓模式查询（双向/单向） ============
+   双向(对冲)：positionSide 必须传 LONG/SHORT，且平仓单不允许传 reduceOnly（-1106）
+   单向(One-way)：positionSide=BOTH + reduceOnly=true（防触发时反向开仓）
+   缓存：内存 Map + localStorage，避免每次加仓重复查询 */
+const DUAL_KEY = "us_dual_v1";
+const dualMem = {};
+async function apiGetMode(acct){
+  const k = acct.api_key;
+  if(typeof dualMem[k] === "boolean") return dualMem[k];
+  try{
+    const c = JSON.parse(localStorage.getItem(DUAL_KEY)||"{}");
+    if(typeof c[k] === "boolean"){ dualMem[k]=c[k]; return c[k]; }
+  }catch(e){}
+  try{
+    const d = await signedFetch(acct, "GET", "/fapi/v1/positionSide/dual",
+      "timestamp="+(await nowMs())+"&recvWindow=10000");
+    const v = !!(d && d.dualSidePosition===true);
+    dualMem[k]=v;
+    try{
+      const c = JSON.parse(localStorage.getItem(DUAL_KEY)||"{}");
+      c[k]=v; localStorage.setItem(DUAL_KEY, JSON.stringify(c));
+    }catch(e){}
+    return v;
+  }catch(e){
+    return (typeof dualMem[k]==="boolean") ? dualMem[k] : null;
+  }
+}
+
+/* ============ 普通止损单（STOP_MARKET + reduceOnly/双向positionSide） ============ */
+async function openOrdersOf(acct, sym){
+  const d = await signedFetch(acct, "GET", "/fapi/v1/openOrders",
+    "symbol="+sym+"&timestamp="+(await nowMs())+"&recvWindow=10000");
   return Array.isArray(d) ? d : [];
+}
+async function cancelOneOrder(acct, sym, orderId){
+  const q = "symbol="+sym+"&orderId="+orderId+"&timestamp="+(await nowMs())+"&recvWindow=10000";
+  const d = await signedFetch(acct, "DELETE", "/fapi/v1/order", q);
+  return !(d && d.code!==undefined);
+}
+async function queryOrder(acct, sym, clientOrderId){
+  try{
+    const d = await signedFetch(acct, "GET", "/fapi/v1/order",
+      "symbol="+sym+"&origClientOrderId="+encodeURIComponent(clientOrderId)+
+      "&timestamp="+(await nowMs())+"&recvWindow=10000");
+    if(d && d.code===undefined && d.orderId) return d;
+    return null;
+  }catch(e){ return null; }
+}
+
+/* ============ 算法单（条件单） ============ */
+async function cancelOneAlgo(acct, sym, algo){
+  let idQ = "";
+  if(algo && algo.clientAlgoId) idQ = "clientAlgoId="+encodeURIComponent(algo.clientAlgoId);
+  else if(algo && algo.algoId != null) idQ = "algoId="+algo.algoId;
+  if(!idQ) return false;
+  const q = "symbol="+sym+"&"+idQ+"&timestamp="+(await nowMs())+"&recvWindow=10000";
+  const d = await signedFetch(acct, "DELETE", "/fapi/v1/algoOrder", q);
+  return !(d && d.code!==undefined);
+}
+/* 列出全部活动算法单（条件单）——币安 Algo Service 的 openAlgoOrders 接口，
+   返回数组含 algoId/clientAlgoId/algoType/orderType/symbol/side/positionSide，
+   能扫到 App 手动挂的、本站挂的、历史残留的（本地无记录也能自动撤销） */
+async function openAlgoOrdersOf(acct){
+  try{
+    const d = await signedFetch(acct, "GET", "/fapi/v1/openAlgoOrders",
+      "timestamp="+(await nowMs())+"&recvWindow=10000");
+    return Array.isArray(d) ? d : [];
+  }catch(e){ return []; }
+}
+/* 查询单条条件单：必须带 algoId/clientAlgoId（不带则返回 -1102），只用于超时后确认是否已挂上 */
+async function queryAlgo(acct, sym, clientAlgoId){
+  if(!clientAlgoId) return null;
+  try{
+    const d = await signedFetch(acct, "GET", "/fapi/v1/algoOrder",
+      "symbol="+sym+"&clientAlgoId="+encodeURIComponent(clientAlgoId)+
+      "&timestamp="+(await nowMs())+"&recvWindow=10000");
+    if(d && d.code===undefined && d.clientAlgoId) return d;
+    return null;
+  }catch(e){ return null; }
 }
 /* 市价加仓（带网络自愈）：请求超时/网络错误时先查持仓确认是否已成交，
    成交了就视为成功（不重复下），没成交才重试；限流/繁忙则退避后重试 */
@@ -756,153 +873,275 @@ async function postOrderAutoRobust(acct, sym, dir, qty, preAmt){
   }
   throw new Error("加仓请求多次网络超时且无法确认是否成交——请立即在币安确认仓位，若已加仓请手动补设止损");
 }
-// 撤算法止损单（按 clientAlgoId）
-async function cancelAlgo(acct, clientAlgoId){
-  const q = "clientAlgoId=" + clientAlgoId + "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
-  return await signedFetch(acct, "DELETE", "/fapi/v1/algoOrder", q);
-}
-// 撤掉该账户该币该方向的旧算法止损单：
-// 1) 服务端扫描 + 校验：撤掉该交易对同方向上所有平仓止损条件单
-//    （覆盖 STOP_MARKET 与 TRAILING_STOP_MARKET），最多 4 轮，每轮撤销后重新
-//    查询校验，列表查询失败（网络抖动）会重试，确保旧止损真正被撤干净，
-//    新止损才不会被币安「同方向只允许一个 closePosition 条件单」(-4130) 拒绝；
-// 2) 本地跟踪表兜底（服务端扫描失败或订单未在列表中时）
-async function cancelPosSL(acct, acctIdx, sym, dir){
+/* 撤旧止损（普通单 + 服务端条件单 + 本地旧记录，三路全扫）：
+   1) openOrders 撤普通 STOP_MARKET 单（含 App 手动挂的普通止损）
+   2) openAlgoOrders 撤服务端活动条件单（CONDITIONAL，含 App 手动挂的与历史残留的——
+      不需要本地记录，彻底解决“服务端有止损但本地无记录撤不掉”的死锁）
+   3) 本地记录的旧版算法单（兼容历史，clientAlgoId 逐条撤）
+   每条最多重试 3 次并确认撤销成功；只有确认撤掉的记录才从本地移除，
+   失败的记录原样保留（下次加仓/续跑会再撤）——记录与服务端始终一致，绝不误清 */
+async function cancelPosSL(acct, sym, dir){
   const all = loadSLTracking();
   const wantSide = dir === "long" ? "SELL" : "BUY";
-  const removed = [];
-  const matches = o => {
-    const type = String(o.type || "");
-    if (type !== "STOP_MARKET" && type !== "TRAILING_STOP_MARKET") return false;
-    if (String(o.side) !== wantSide) return false;
-    const isClose = String(o.closePosition) === "true" ||
-                    (o.closePosition === undefined && String(o.reduceOnly) === "true");
-    return isClose;
-  };
-  let n = 0;
-  for (let round=0; round<4; round++){
-    let open = [];
-    let listOk = false;
-    for (let listTry=0; listTry<3; listTry++){
-      try{ open = await listOpenAlgo(acct, sym); listOk = true; break; }catch(e){
-        await sleep(700 * (listTry + 1));
+  const wantPS = dir === "long" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
+  let n=0; const okIds=[];
+  // 1) 撤普通止损单（openOrders 可见，含 App 手动挂的）
+  let open=[], openOk=false;
+  try{ open = await openOrdersOf(acct, sym); openOk=true; }catch(e){}
+  const targets = (Array.isArray(open)?open:[]).filter(o =>
+    String(o.type)==="STOP_MARKET" &&
+    String(o.side)===wantSide &&
+    (wantPS.indexOf(String(o.positionSide))>=0) &&
+    (o.reduceOnly===true || String(o.reduceOnly)==="true"));
+  for(const o of targets){
+    if(!o.orderId) continue;
+    let done=false;
+    for(let t=0; t<3 && !done; t++){
+      try{ done = await cancelOneOrder(acct, sym, o.orderId); }catch(e){ done=false; }
+      if(!done) await sleep(500*(t+1));
+    }
+    if(done){ n++; okIds.push("o:"+o.orderId); }
+  }
+  // 2) 撤服务端活动条件单（openAlgoOrders 全量扫描，无需本地记录；
+  //    只撤 STOP_MARKET 止损单，不动 App 手动挂的止盈单）
+  let algos=[], algoOk=false;
+  try{ algos = await openAlgoOrdersOf(acct); algoOk=true; }catch(e){}
+  const algoTargets = (Array.isArray(algos)?algos:[]).filter(o =>
+    o.symbol===sym &&
+    String(o.orderType||o.type)==="STOP_MARKET" &&
+    String(o.side)===wantSide &&
+    (wantPS.indexOf(String(o.positionSide))>=0));
+  for(const o of algoTargets){
+    if(!(o.clientAlgoId || o.algoId!=null)) continue;
+    let done=false;
+    for(let t=0; t<3 && !done; t++){
+      try{ done = await cancelOneAlgo(acct, sym, {clientAlgoId:o.clientAlgoId, algoId:o.algoId}); }catch(e){ done=false; }
+      if(!done) await sleep(500*(t+1));
+    }
+    if(done){
+      n++;
+      okIds.push("a:"+(o.clientAlgoId || String(o.algoId)));
+    }
+  }
+  // 3) 撤旧版算法单（本地记录含 clientAlgoId，兼容历史）
+  for(const it of all){
+    if(!(it.symbol===sym && it.dir===dir)) continue;
+    if(!it.clientAlgoId) continue;
+    if(okIds.indexOf("a:"+it.clientAlgoId)>=0) continue;   // 步骤2 已撤掉
+    let done=false;
+    for(let t=0; t<3 && !done; t++){
+      try{ done = await cancelOneAlgo(acct, sym, it); }catch(e){ done=false; }
+      if(!done) await sleep(500*(t+1));
+    }
+    if(done){ n++; okIds.push("a:"+it.clientAlgoId); }
+  }
+  // 只清确认撤掉的记录；openOrders 查询成功时，orderId 不在 openOrders 的记录
+  // 说明该止损单已触发/已撤（服务端已无此单）→ 一并清理防堆积；
+  // openOrders 查询失败时（openOk=false）不清理任何 orderId 记录，保证绝不误清
+  if(okIds.length || openOk){
+    const openIds = new Set(open.map(o=>String(o.orderId)));
+    saveSLTracking(all.filter(x => {
+      if(!(x.symbol===sym && x.dir===dir)) return true;
+      if(x.orderId){
+        if(okIds.indexOf("o:"+x.orderId)>=0) return false;      // 确认撤掉
+        if(openOk && !openIds.has(String(x.orderId))) return false; // 服务端已无此单
+        return true;
       }
-    }
-    if (!listOk){ await sleep(800); continue; }        // 列表都查不到，下一轮再试
-    const targets = open.filter(matches);
-    if (!targets.length) break;                        // 已清空
-    let roundHit = false;
-    for (const o of targets){
-      try{
-        await cancelAlgo(acct, o.clientAlgoId);
-        n++; roundHit = true;
-        if (o.clientAlgoId) removed.push(o.clientAlgoId);
-      }catch(e){}
-    }
-    if (!roundHit) await sleep(600);
-    await sleep(400);
+      if(x.clientAlgoId && okIds.indexOf("a:"+x.clientAlgoId)>=0) return false;
+      return true;
+    }));
   }
-  // 本地跟踪表兜底（服务端扫描失败或订单未在列表中时）
-  const kept = [];
-  for (const o of all){
-    if (o.acctIdx === acctIdx && o.symbol === sym && o.dir === dir){
-      if (removed.indexOf(o.clientAlgoId) >= 0) continue;
-      try{ await cancelAlgo(acct, o.clientAlgoId); n++; }catch(e){ kept.push(o); }
-    } else kept.push(o);
-  }
-  saveSLTracking(kept);
   return n;
 }
-// 设置仓位止损：浮盈回撤 50% 时触发（浮盈 5U → 回撤到剩 2.5U 对应价格）
-// 走 Algo Order API（/fapi/v1/algoOrder），closePosition=true 的仓位级止损必须走这个接口
-// 【稳定性保障】最多重试 8 次、退避递增：
-//  - 网络超时/错误：先查服务端该止损是否其实已挂上（有则视为成功），没有才重试
-//  - 限流/繁忙(-1003/-1015/-1004)：等待后重试
-//  - -2021/-4004（触发价距现价过近会立即触发）：把触发价推远 0.5% 重试
-//    （推远后不许越过入场价：多单不低于入场价×1.001、空单不高于入场价×0.999，杜绝“触发即亏损”）
-//  - -4130（同方向已存在 closePosition 条件单）：先强制撤干净旧止损并校验，再原地重试
-//  - 其余错误：退避后重试
-async function setStopLoss(acct, acctIdx, sym, pos, dir){
+/* 设置仓位止损：浮盈回撤 50% 时触发
+   止损价 = 入场均价 + 当前浮盈的 50%（多单示例）：
+     多单：入场价 + (现价-入场价)×0.5；空单：入场价 - (入场价-现价)×0.5
+   止损价永远夹在入场均价与现价之间：无论加仓几次、均价如何被抬高，
+   每次挂出的止损都严格锁定当前浮盈的一半，绝不会低于入场价（多单）/高于入场价（空单），杜绝“止损即亏损”。
+   【直接设止损·双通道自适应】最多重试 2 次，失败立即抛出弹窗转人工：
+    通道1 普通 STOP_MARKET（POST /fapi/v1/order）：大多数品种支持（含双向/单向模式适配）；
+    通道2 算法单 closePosition=true（POST /fapi/v1/algoOrder）：币安对部分品种
+          （如 CYPHUSDT）已拒绝普通端点挂止损（-4120 “use the Algo Order API”），自动切换；
+          算法单遇 -4130（同方向已有 closePosition 单）→ 撤旧后再挂
+   - 网络超时/错误：先查服务端该止损是否其实已挂上（有则视为成功），没有才重试
+   - 限流/繁忙(-1003/-1015/-1004)：等待后重试
+   - -2021/-4004（触发价距现价过近会立即触发）：把触发价推远 0.5% 重试
+     （推远后的触发价不允许越过入场价：多单不低于入场价×1.001、空单不高于入场价×0.999） */
+async function setStopLoss(acct, sym, pos, dir){
   const amtAbs = Math.abs(pos.amt);
   if (!(pos.unrealized > 0) || amtAbs <= 0){
     throw new Error("当前无浮盈，跳过止损设置");
   }
-  const half = pos.unrealized * 0.5 / amtAbs;
-  let stopPrice = pos.amt > 0 ? pos.mark - half : pos.mark + half;
-  const side = pos.amt > 0 ? "SELL" : "BUY";
-  const wantDir = pos.amt > 0 ? "long" : "short";
   const rule = (await getRules())[sym] || {};
-  const pp = rule.pricePrec || 2;
-  // positionSide 候选：双向 LONG/SHORT，单向 BOTH
-  const cands = wantDir === "long" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
-  const BACKOFF = [600, 1000, 1500, 2500, 3500, 5000, 5000];
+  const prec = rule.pricePrec || 2;
+  const side = pos.amt > 0 ? "SELL" : "BUY";
+  // 持仓模式：双向(对冲)挂平仓单不允许传 reduceOnly（-1106）、positionSide 用 LONG/SHORT；
+  // 单向模式必须带 reduceOnly=true + positionSide=BOTH（防触发时反向开仓）
+  const dual = await apiGetMode(acct);
+  let isDual = (dual===true);
+  // 止损数量：当前持仓量向下取整到交易所最小步长（市价加仓后的数量常有碎小数位，
+  // 直接下单会报 -1111 精度错误），保证数量合法
+  let slQty = amtAbs;
+  if(rule.step>0){
+    slQty = Math.floor(amtAbs/rule.step)*rule.step;
+    slQty = parseFloat(slQty.toFixed(10));
+  }
+  if(slQty<=0) slQty = amtAbs;               // 极小仓取整为0时保持原值尝试
+  // 止损价：入场价与现价之间取浮盈一半（锁定浮盈 50%）
+  let stopPrice;
+  if(pos.entry>0){
+    const profitPerUnit = pos.amt>0 ? (pos.mark-pos.entry) : (pos.entry-pos.mark);
+    stopPrice = pos.amt>0 ? (pos.entry+profitPerUnit*0.5) : (pos.entry-profitPerUnit*0.5);
+  }else{
+    const half = pos.unrealized*0.5/amtAbs;
+    stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
+  }
+  const BACKOFF = [600,1200];
   let lastErr = null;
-  for (let attempt=0; attempt<8; attempt++){
-    const clientAlgoId = newClientAlgoId();
-    const triggerPrice = stopPrice.toFixed(pp);
+  let placedOrderId = null, placedAlgoId = null;
+  for(let attempt=0; attempt<2; attempt++){
+    const clientOrderId = newClientAlgoId();
+    const triggerPrice = stopPrice.toFixed(prec);
     let outcome = "error";                             // "placed" | "error"
-    for (const ps of cands){
-      let data = null, netErr = null;
+    let needAlgo = false;
+    // —— 通道1：普通 STOP_MARKET ——
+    for(const ps of (isDual ? (dir==="long" ? ["LONG"] : ["SHORT"]) : ["BOTH"])){
+      let data=null, netErr=null;
       try{
-        const q = "algoType=CONDITIONAL&symbol=" + sym + "&side=" + side +
-          "&type=STOP_MARKET&triggerPrice=" + triggerPrice +
-          "&closePosition=true&positionSide=" + ps +
-          "&clientAlgoId=" + clientAlgoId +
-          "&timestamp=" + (await nowMs()) + "&recvWindow=10000";
-        data = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
-      }catch(e){ netErr = e; }
-      if (netErr){
+        const q = "symbol="+sym+"&side="+side +
+          "&type=STOP_MARKET&stopPrice="+triggerPrice +
+          "&quantity="+slQty+(isDual?"":"&reduceOnly=true")+"&positionSide="+ps +
+          "&timeInForce=GTE_GTC&newClientOrderId="+clientOrderId +
+          "&timestamp="+(await nowMs())+"&recvWindow=10000";
+        data = await signedFetch(acct, "POST", "/fapi/v1/order", q);
+      }catch(e){ netErr=e; }
+      if(netErr){
         lastErr = netErr;
-        await sleep(800);
+        await sleep(600);
         try{
-          const open = await listOpenAlgo(acct, sym);
-          if (open.find(o => String(o.clientAlgoId) === clientAlgoId ||
-             (String(o.type) === "STOP_MARKET" && String(o.side) === side && String(o.closePosition) === "true"))){
-            outcome = "placed";                        // 超时但其实已挂上
-          }
+          const placed = await queryOrder(acct, sym, clientOrderId);
+          if(placed){ placedOrderId = placed.orderId; outcome = "placed"; }  // 超时但其实已挂上
         }catch(e){}
-        break;                                         // 网络错误 → 退避后整轮重试
+        break;                                           // 网络错误 → 退避后整轮重试
       }
-      if (data && data.code !== undefined){
+      if(data && data.code!==undefined){
         lastErr = data;
-        if (data.code === -4061){ continue; }          // 换 positionSide
-        if (data.code === -1021){ await forceResync(); break; }
-        if (data.code === -2021 || data.code === -4004){ // 触发价太近 → 推远 0.5%（不许越过入场价）
-          const buf = pos.mark * 0.005;
-          if (pos.amt > 0){
-            const floor = pos.entry > 0 ? pos.entry * 1.001 : -Infinity;
-            stopPrice = Math.max(pos.mark - buf, floor);
-          } else {
-            const ceil = pos.entry > 0 ? pos.entry * 0.999 : Infinity;
-            stopPrice = Math.min(pos.mark + buf, ceil);
+        if(data.code===-1106 && isDual){                 // 双向姿势被拒（实际为单向）→ 切单向参数
+          isDual = false;
+          continue;
+        }
+        if(data.code===-4061){ continue; }               // 换 positionSide
+        if(data.code===-1021){ await ensureOffset(true); break; }
+        if(data.code===-4120){ needAlgo = true; break; } // 该品种普通端点不支持挂止损 → 切算法单通道
+        if(data.code===-2021 || data.code===-4004){      // 触发价太近 → 推远 0.5%（不许越过入场价）
+          const buf = pos.mark*0.005;
+          if(pos.amt>0){
+            const floor = pos.entry>0 ? pos.entry*1.001 : -Infinity;
+            stopPrice = Math.max(pos.mark-buf, floor);
+          }else{
+            const ceil = pos.entry>0 ? pos.entry*0.999 : Infinity;
+            stopPrice = Math.min(pos.mark+buf, ceil);
           }
           break;
         }
-        if (data.code === -4130 || /close.?position/i.test(data.msg || "")){
-          // 旧止损没撤干净 → 强制撤干净并校验，再原地重试
-          try{ await cancelPosSL(acct, acctIdx, sym, dir); }catch(e){}
-          await sleep(500);
-          break;
-        }
-        break;                                         // 其他错误（限流/繁忙等）→ 退避重试
+        break;                                           // 其他错误（限流/繁忙等）→ 退避重试
       }
-      outcome = "placed";                              // 服务端已返回成功
+      if(data && data.orderId){ placedOrderId = data.orderId; outcome = "placed"; break; }
+      outcome = "placed";                                // 服务端已返回成功
       break;
     }
-    if (outcome === "placed"){
+    // —— 通道2：普通端点拒绝（-4120）→ 算法单 closePosition=true ——
+    if(outcome==="error" && needAlgo){
+      for(let a=0; a<2; a++){
+        let d=null, nErr=null;
+        try{
+          // 算法单参数：algoType=CONDITIONAL 必填（缺失报 -1102），
+          // 触发价字段是 triggerPrice（不是 stopPrice），closePosition=true 自带只平仓属性
+          const q = "symbol="+sym+"&side="+side+"&algoType=CONDITIONAL&type=STOP_MARKET&triggerPrice="+triggerPrice+
+            "&positionSide="+(isDual ? (dir==="long"?"LONG":"SHORT") : "BOTH")+
+            "&closePosition=true&timeInForce=GTC&newClientAlgoId="+clientOrderId+
+            "&timestamp="+(await nowMs())+"&recvWindow=10000";
+          d = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
+        }catch(e){ nErr=e; }
+        if(nErr){
+          lastErr = nErr;
+          await sleep(600);
+          try{
+            const placed = await queryAlgo(acct, sym, clientOrderId);
+            if(placed){ placedAlgoId = clientOrderId; outcome = "placed"; }  // 超时但其实已挂上
+          }catch(e){}
+          break;
+        }
+        if(d && d.code!==undefined){
+          lastErr = d;
+          if(d.code===-4130 || /close.?position/i.test(d.msg||"")){
+            // 同方向已有 closePosition 条件单：按本地记录撤旧（本站挂的算法单都存了
+            // clientAlgoId，可自动撤销）；撤不掉且本地无记录 → 明确提示手动处理
+            const cancelled = await cancelPosSL(acct, sym, dir);
+            if(cancelled===0){
+              const before = loadSLTracking().filter(x=>x.symbol===sym && x.dir===dir);
+              if(before.length===0){
+                throw new Error("检测到同方向已有旧版止损单残留且本站无记录（币安不允许通过API自动撤销）——请打开币安App→合约→策略委托手动删除该止损单后重新加仓");
+              }
+            }
+            await sleep(500);
+            continue;
+          }
+          if(d.code===-4061){ continue; }
+          if(d.code===-1021){ await ensureOffset(true); break; }
+          if(d.code===-2021 || d.code===-4004){
+            const buf = pos.mark*0.005;
+            if(pos.amt>0){
+              const floor = pos.entry>0 ? pos.entry*1.001 : -Infinity;
+              stopPrice = Math.max(pos.mark-buf, floor);
+            }else{
+              const ceil = pos.entry>0 ? pos.entry*0.999 : Infinity;
+              stopPrice = Math.min(pos.mark+buf, ceil);
+            }
+            break;
+          }
+          break;
+        }
+        if(d && (d.clientAlgoId || d.algoId)){ placedAlgoId = d.clientAlgoId || String(d.algoId); outcome = "placed"; break; }
+        outcome = "placed";                              // 服务端已返回成功
+        break;
+      }
+    }
+    if(outcome === "placed"){
       const all = loadSLTracking();
-      all.push({acctIdx, symbol:sym, dir:wantDir, clientAlgoId, triggerPrice:stopPrice,
-                created:new Date().toLocaleString("zh-CN",{hour12:false})});
+      if(placedAlgoId){
+        all.push({symbol:sym, dir, clientAlgoId:placedAlgoId, triggerPrice:stopPrice,
+          created:new Date().toLocaleString("zh-CN",{hour12:false})});
+      }else{
+        all.push({symbol:sym, dir, orderId:placedOrderId, clientOrderId, triggerPrice:stopPrice,
+          created:new Date().toLocaleString("zh-CN",{hour12:false})});
+      }
       saveSLTracking(all);
       return stopPrice;
     }
-    if (attempt < 7) await sleep(BACKOFF[attempt]);
+    if(attempt<1) await sleep(BACKOFF[attempt]);
   }
-  if (lastErr){
-    if (lastErr && lastErr.code !== undefined) throw new Error("设止损失败 code " + lastErr.code + ": " + (lastErr.msg || ""));
-    throw new Error("设止损失败：" + ((lastErr && lastErr.message) || "网络错误") + "（已重试8次）");
+  if(lastErr){
+    if(lastErr && lastErr.code!==undefined) throw new Error("设止损失败 code "+lastErr.code+": "+(lastErr.msg||""));
+    throw new Error("设止损失败："+((lastErr&&lastErr.message)||"网络错误")+"（已重试2次）");
   }
   throw new Error("设止损失败（未知错误）");
+}
+/* 止损保障流程（查持仓 → 撤旧止损 → 挂新止损）：加仓主流程与断点续跑共用，
+   失败立即抛出 → 上层弹窗转人工处理 */
+async function applyStopLoss(acct, sym, dir){
+  let pos=null, posErr=null;
+  for(let t=0; t<3 && !pos; t++){
+    try{ pos = await getPosition(acct, sym, dir); }catch(e){ posErr=e; }
+    if(!pos) await sleep(800);
+  }
+  if(!pos){
+    if(posErr) throw new Error("持仓查询网络失败（"+posErr.message+"）——请手动确认仓位并设置止损");
+    throw new Error("该持仓已平仓，无需设置止损");
+  }
+  await cancelPosSL(acct, sym, dir);            // 撤旧止损（内部校验，撤干净为止）
+  const stopPrice = await setStopLoss(acct, sym, pos, dir);  // 直接挂新止损
+  return {stopPrice, pos};
 }
 async function addPos(sym, acctIdx, setSL, dir){
   const msg = document.getElementById(setSL ? "p1msg" : "p2msg");
@@ -970,6 +1209,150 @@ async function addPos(sym, acctIdx, setSL, dir){
     msg.className = "pmsg err";
     msg.textContent = sym + " 加仓失败：" + e.message;
     btn.disabled = false; btn.textContent = "加仓";
+  }
+}
+
+/* ================= 页1 加仓止损（移植 roi-board 完整逻辑） ================= */
+function esc(s){ return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
+/* 执行记录：成功/失败各占一行（只保留最新 5 条） */
+const LOG_MAX = 5;
+function addLog(html, cls){
+  const box = document.getElementById("p1exec");
+  if(!box) return;
+  const line = document.createElement("div");
+  line.className = "log-line "+(cls||"");
+  line.innerHTML = "<span class='log-time'>"+new Date().toLocaleTimeString("zh-CN",{hour12:false})+"</span>"+html;
+  box.appendChild(line);
+  while(box.children.length > LOG_MAX+1){ box.removeChild(box.children[1]); }
+  box.scrollTop = box.scrollHeight;
+}
+/* 全局加仓串行锁：手动点击与续跑严格一条一条执行（上一条加仓+设止损全部完成后，
+   下一条才开始），杜绝并发叠加导致止损互相干扰 */
+let addBusy = false;
+async function addPosV2(sym, acctIdx, dir){
+  while(addBusy) await sleep(250);        // 等上一条执行完
+  addBusy = true;
+  try{
+    return await doAddPosV2(sym, acctIdx, dir);
+  }finally{
+    addBusy = false;
+  }
+}
+async function doAddPosV2(sym, acctIdx, dir){
+  const accounts = loadKeys().filter(a => a && a.api_key && a.api_secret);
+  const acct = accounts[acctIdx];
+  if(!acct) throw new Error("账户不存在");
+  const name = acct.name || ("账户"+(acctIdx+1));
+  const msg = document.getElementById("p1msg");
+  const btn = document.querySelector('#p1body button[data-add="' + sym + "|" + acctIdx + "|" + dir + '"]');
+  if(btn){ btn.disabled = true; btn.textContent = "加仓中…"; }
+  try{
+    await ensureOffset();
+    // 1. 实时校验 ROI ≥ 100（回撤到 100% 以下不执行）
+    const pre = await getPosition(acct, sym, dir);
+    if(!pre) throw new Error("未查到该持仓");
+    if(pre.roi < 100) throw new Error("投资回报率 "+pre.roi.toFixed(2)+"% < 100%，不满足加仓条件");
+
+    // 2. 计算数量：当前持仓数量的 38%；算出数量太小（低于系统最小开仓要求）
+    //    时改用最小加仓数量，保证能正常下单
+    const rule = (await getRules())[sym] || {};
+    let qty = Math.abs(pre.amt) * 0.38;
+    let useMinFallback = false;
+    if(rule.step>0){
+      qty = Math.floor(qty/rule.step)*rule.step;
+      qty = parseFloat(qty.toFixed(10));
+    }
+    if(qty<=0 || qty*pre.mark < rule.minNotional || (rule.minQty>0 && qty < rule.minQty)){
+      // 数量不足时改用最小加仓数量：先按最少开仓金额折算，再向上取整到最小步长/最小数量
+      qty = (rule.minNotional+1)/pre.mark;
+      if(rule.minQty>0 && qty < rule.minQty) qty = rule.minQty;
+      if(rule.step>0){
+        qty = Math.ceil(qty/rule.step)*rule.step;
+        qty = parseFloat(qty.toFixed(10));
+      }
+      useMinFallback = true;
+    }
+    if(qty<=0) throw new Error("计算出的加仓数量为 0");
+
+    // 3. 市价加仓（网络超时也会查持仓确认是否已成交，绝不盲目重下）
+    //    记录断点：加仓开始（phase=add）；成交后切到 phase=sl，重开页面可续跑补设止损
+    upsertPending({acctIdx, sym, dir, phase:"add", ts:Date.now()});
+    const filled = await postOrderAutoRobust(acct, sym, dir, qty, Math.abs(pre.amt));
+    if(!filled.filled){
+      clearPending(acctIdx, sym, dir);
+      throw new Error("加仓未成交（网络异常且持仓无变化）");
+    }
+    upsertPending({acctIdx, sym, dir, phase:"sl", ts:Date.now()});
+
+    // 4. 【核心保障】加仓已成交 → 直接撤旧止损 → 挂新止损（一次性完成）；
+    //    失败立即弹窗转人工处理
+    await sleep(600);
+    const sl = await applyStopLoss(acct, sym, dir);
+    const stopPrice = sl.stopPrice;
+    const pos = sl.pos;
+    clearPending(acctIdx, sym, dir);
+
+    const note = useMinFallback
+      ? "加仓数量低于系统最小要求，按最小加仓数量"+qty
+      : "按当前持仓38%加仓"+qty;
+    // 执行完止损后立即刷新：不符合加仓条件的持仓马上从列表刷新掉，不留过期行
+    const okMsg = "["+esc(name)+"] "+sym+" "+(dir==="long"?"多":"空")+
+      " 加仓成功："+note+" · 新止损"+stopPrice.toFixed(rule.pricePrec||2)+
+      "（浮盈"+fmtUsd(pos.unrealized)+"回撤50%即"+fmtUsd(pos.unrealized*0.5)+"触发）";
+    try{ await refresh(); }catch(_){}
+    msg.className = "pmsg ok";
+    msg.textContent = sym + " 加仓成功，止损已设置（详见下方执行记录）";
+    addLog(okMsg, "log-ok");                        // 成功记录单独一行
+  }catch(e){
+    // 已成交但止损未完成（phase=sl）：强制弹窗提示手动设置，关闭弹窗才能继续下一个加仓
+    const pend = loadPending().find(x=>x.acctIdx===acctIdx && x.sym===sym && x.dir===dir);
+    if(pend && pend.phase==="sl"){
+      clearPending(acctIdx, sym, dir);   // 已转人工处理，不再自动续跑
+      try{
+        window.alert("【止损设置失败，必须手动处理】\n\n["+name+"] "+sym+" 加仓已成交，但自动设置止损失败：\n"+
+          e.message+"\n\n请立即打开币安App，手动为 "+sym+" 设置止损！\n（点击确定后继续下一个）");
+      }catch(_){}
+    }else{
+      clearPending(acctIdx, sym, dir);
+    }
+    const errMsg = "["+esc(name)+"] "+sym+" 加仓失败："+esc(e.message);
+    // 即使中途失败也立即刷新，避免残留过期的加仓行
+    try{ await refresh(); }catch(_){}
+    msg.className = "pmsg err";
+    msg.textContent = sym + " 加仓失败：" + e.message;
+    addLog(errMsg, "log-err");                      // 错误记录单独一行
+    throw e;
+  }
+}
+
+/* 断点续跑：重开页面自动补设未完成的止损（手机端防杀） */
+async function resumePendingSL(){
+  const pend = loadPending().filter(x=>x.phase==="sl");
+  if(!pend.length) return;
+  const accounts = loadKeys().filter(a => a && a.api_key && a.api_secret);
+  for(const t of pend){
+    const acct = accounts[t.acctIdx];
+    if(!acct) continue;
+    const name = acct.name || ("账户"+(t.acctIdx+1));
+    // 本地已记录该品种止损（止损早已设好/手动处理过）→ 直接清除待办，绝不重复补跑
+    const hasLocal = loadSLTracking().some(x=>x.symbol===t.sym && x.dir===t.dir);
+    if(hasLocal){ clearPending(t.acctIdx, t.sym, t.dir); continue; }
+    const msg = document.getElementById("p1msg");
+    msg.className = "pmsg";
+    msg.textContent = "检测到未完成的止损任务 ["+name+"] "+t.sym+"，正在补设止损…";
+    try{
+      const sl = await applyStopLoss(acct, t.sym, t.dir);
+      clearPending(t.acctIdx, t.sym, t.dir);
+      addLog("["+esc(name)+"] "+t.sym+" 止损已补设 @"+sl.stopPrice.toFixed((await getRules())[t.sym]?.pricePrec||2), "log-ok");
+    }catch(e){
+      if(/无需|已平仓|不存在/i.test(e.message)){
+        clearPending(t.acctIdx, t.sym, t.dir);
+        addLog("["+esc(name)+"] "+t.sym+" "+esc(e.message)+"（已清理待办）", "log-warn");
+      }else{
+        addLog("["+esc(name)+"] "+t.sym+" 补设止损失败："+esc(e.message)+"（请手动在币安设置止损，待办任务将自动过期）", "log-err");
+      }
+      break;   // 一个失败先停下，避免连续全失败
+    }
   }
 }
 
@@ -1053,7 +1436,7 @@ document.getElementById("p1body").addEventListener("click", e => {
   const b = e.target.closest("button[data-add]");
   if (!b) return;
   const parts = b.dataset.add.split("|");
-  addPos(parts[0], parseInt(parts[1],10), true, parts[2]);   // 页 1：加仓 + 设止损
+  addPosV2(parts[0], parseInt(parts[1],10), parts[2]);   // 页 1：38%加仓 + 撤旧止损 + 挂新止损（roi-board 逻辑）
 });
 document.getElementById("p2body").addEventListener("click", e => {
   const b = e.target.closest("button[data-add]");
@@ -1070,6 +1453,7 @@ document.getElementById("p1body").innerHTML = emptyRow("点击右上角「刷新
 document.getElementById("p2body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 6);
 document.getElementById("p3body").innerHTML = emptyRow("点击右上角「刷新数据」加载持仓", 3);
 if (loadKeys().some(k => k && k.api_key && k.api_secret)) refresh();
+resumePendingSL();
 </script>
 </body>
 </html>
