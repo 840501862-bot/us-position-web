@@ -135,6 +135,14 @@
   .key-row input:focus { border-color:var(--blue); }
   .key-row .del { color:var(--red); background:none; border:none; cursor:pointer; font-size:16px; padding:6px; }
   .key-row .del:hover { filter:brightness(1.4); }
+  .key-row .secret-wrap { position:relative; }
+  .key-row .secret-wrap input { padding-right:42px; }
+  .key-row .eye {
+    position:absolute; right:6px; top:50%; transform:translateY(-50%);
+    background:none; border:none; color:var(--sub); cursor:pointer;
+    font-size:11px; padding:4px 5px; line-height:1; border-radius:5px;
+  }
+  .key-row .eye:hover { color:var(--blue); background:rgba(77,142,240,.12); }
   .modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; }
   .modal-actions .note { font-size:11px; color:var(--sub); margin-right:auto; padding-top:8px; }
   .err { color:var(--red); font-size:12px; margin-top:8px; min-height:16px; }
@@ -217,7 +225,7 @@
 <div class="overlay" id="overlay">
   <div class="modal">
     <h3>设置 API 密钥</h3>
-    <div class="m-sub">每个账户一行：API Key + Secret。密钥只保存在本浏览器的 localStorage，不会上传任何地方；可随时清除。</div>
+    <div class="m-sub">每个账户一行：API Key + Secret。密钥只保存在本浏览器的 localStorage，不会上传任何地方；可随时清除。Secret 默认隐藏（输入框留空表示不修改已保存的 Secret）。</div>
     <div id="keyRows"></div>
     <button class="ghost" id="btnAddKey">+ 添加账户</button>
     <div class="err" id="keyErr"></div>
@@ -324,6 +332,21 @@ async function nowMs(){
 
 function loadKeys(){ try{ return JSON.parse(localStorage.getItem("us_keys_v1")||"[]"); }catch(e){ return []; } }
 function saveKeys(k){ try{ localStorage.setItem("us_keys_v1", JSON.stringify(k)); }catch(e){ throw new Error("本浏览器禁用了 localStorage，无法保存密钥"); } }
+
+/* 每个密钥行的已存 Secret（不写进输入框，避免明文回显；WeakMap 随行元素回收） */
+const keySecrets = new WeakMap();
+function secretHint(s){
+  if (!s) return "API Secret";
+  return "已存 · 尾号 " + String(s).slice(-4);
+}
+function secretCell(saved){
+  return '<div class="secret-wrap">'
+    + '<input data-f="api_secret" type="password" autocomplete="new-password" spellcheck="false"'
+    + ' title="留空表示不修改已保存的 Secret"'
+    + ' placeholder="' + escAttr(secretHint(saved)) + '">'
+    + '<button class="eye" type="button" title="显示 / 隐藏 Secret">显示</button>'
+    + '</div>';
+}
 
 /* ================= 账户切换下拉 ================= */
 let selAcct = (function(){
@@ -1367,9 +1390,10 @@ function openKeysModal(){
     row.className = "key-row";
     row.innerHTML =
       '<input data-f="name" placeholder="账户名" value="' + escAttr(k.name||("账户"+(i+1))) + '">' +
-      '<input data-f="api_key" placeholder="API Key" spellcheck="false" value="' + escAttr(k.api_key||"") + '">' +
-      '<input data-f="api_secret" placeholder="API Secret" spellcheck="false" value="' + escAttr(k.api_secret||"") + '">' +
+      '<input data-f="api_key" placeholder="API Key" spellcheck="false" autocomplete="off" value="' + escAttr(k.api_key||"") + '">' +
+      secretCell(k.api_secret||"") +
       '<button class="del" title="删除该账户">✕</button>';
+    keySecrets.set(row, k.api_secret||"");
     rows.appendChild(row);
   });
   document.getElementById("keyErr").textContent = "";
@@ -1386,9 +1410,10 @@ document.getElementById("btnAddKey").addEventListener("click", () => {
   row.className = "key-row";
   row.innerHTML =
     '<input data-f="name" placeholder="账户名" value="账户' + (rows.length+1) + '">' +
-    '<input data-f="api_key" placeholder="API Key" spellcheck="false">' +
-    '<input data-f="api_secret" placeholder="API Secret" spellcheck="false">' +
+    '<input data-f="api_key" placeholder="API Key" spellcheck="false" autocomplete="off">' +
+    secretCell("") +
     '<button class="del" title="删除该账户">✕</button>';
+  keySecrets.set(row, "");
   document.getElementById("keyRows").appendChild(row);
 });
 document.getElementById("keyRows").addEventListener("click", e => {
@@ -1396,6 +1421,18 @@ document.getElementById("keyRows").addEventListener("click", e => {
     const rows = document.querySelectorAll("#keyRows .key-row");
     if (rows.length <= 1){ document.getElementById("keyErr").textContent = "至少保留 1 个账户"; return; }
     e.target.closest(".key-row").remove();
+    return;
+  }
+  if (!e.target.classList.contains("eye")) return;
+  const row = e.target.closest(".key-row");
+  const inp = row.querySelector('[data-f="api_secret"]');
+  if (inp.type === "password"){
+    if (!inp.value) inp.value = keySecrets.get(row) || "";
+    inp.type = "text";
+    e.target.textContent = "隐藏";
+  }else{
+    inp.type = "password";
+    e.target.textContent = "显示";
   }
 });
 document.getElementById("btnSave").addEventListener("click", () => {
@@ -1403,7 +1440,7 @@ document.getElementById("btnSave").addEventListener("click", () => {
   document.querySelectorAll("#keyRows .key-row").forEach(row => {
     const name = row.querySelector('[data-f="name"]').value.trim() || "账户" + (keys.length+1);
     const api_key = row.querySelector('[data-f="api_key"]').value.trim();
-    const api_secret = row.querySelector('[data-f="api_secret"]').value.trim();
+    const api_secret = row.querySelector('[data-f="api_secret"]').value.trim() || keySecrets.get(row) || "";
     keys.push({name, api_key, api_secret});
   });
   saveKeys(keys);
