@@ -613,13 +613,23 @@ function tickCooldown(){
   });
 }
 const RULES_KEY = "us_rules_v3";
-let rulesCache = null;
-async function getRules(){
-  if (rulesCache) return rulesCache;
-  try{                                    // 优先本地缓存（6 小时内），避免重复下载大文件
-    const c = JSON.parse(localStorage.getItem(RULES_KEY) || "null");
-    if (c && c.map && Date.now() - c.t < 6*3600*1000){ rulesCache = c.map; return rulesCache; }
-  }catch(e){}
+let rulesCache = null, rulesFetchAt = 0;
+// 监控清单指纹：增删交易对后旧缓存自动失效，避免新交易对查不到最小开仓额
+const RULES_FP = (() => {
+  let h = 0;
+  for (const s of WATCHLIST){ for (let i=0;i<s.length;i++) h = (h*31 + s.charCodeAt(i)) >>> 0; }
+  return WATCHLIST.length + "-" + h;
+})();
+async function getRules(force){
+  if (rulesCache && !force) return rulesCache;
+  if (!force){
+    try{                                  // 优先本地缓存（6 小时内，且清单未变），避免重复下载大文件
+      const c = JSON.parse(localStorage.getItem(RULES_KEY) || "null");
+      if (c && c.map && c.fp === RULES_FP && Date.now() - c.t < 6*3600*1000){ rulesCache = c.map; return rulesCache; }
+    }catch(e){}
+  } else if (rulesCache && Date.now() - rulesFetchAt < 20000){
+    return rulesCache;                    // 强制刷新 20 秒内不重复请求
+  }
   const d = await fetchJson(FAPI + "/fapi/v1/exchangeInfo", {method:"GET"}, 40000);
   const map = {};
   for (const s of (d.symbols||[])){
@@ -637,8 +647,15 @@ async function getRules(){
     };
   }
   rulesCache = map;
-  try{ localStorage.setItem(RULES_KEY, JSON.stringify({t: Date.now(), map})); }catch(e){}
+  rulesFetchAt = Date.now();
+  try{ localStorage.setItem(RULES_KEY, JSON.stringify({t: rulesFetchAt, fp: RULES_FP, map})); }catch(e){}
   return map;
+}
+// 取单个交易对规则：缓存里没有（例如刚新增的交易对）就强制重拉一次
+async function getRule(sym){
+  let r = (await getRules())[sym];
+  if (!r) r = (await getRules(true))[sym];
+  return r;
 }
 async function apiPost(acct, query){
   return signedFetch(acct, "POST", "/fapi/v1/order", query);
@@ -673,7 +690,7 @@ async function openPos(sym, dir){
     const SEL = getSelAcct();
     const acct = SEL >= 0 ? accounts[SEL] : accounts[0];
     if (!acct) throw new Error("请先在下拉框选择要开仓的账户");
-    const rule = (await getRules())[sym];
+    const rule = await getRule(sym);
     if (!rule || !rule.minNotional) throw new Error("未获取到系统最小开仓额");
     const minN = rule.minNotional;
     const price = await getPrice(sym);
@@ -995,7 +1012,7 @@ async function setStopLoss(acct, sym, pos, dir){
   if (!(pos.unrealized > 0) || amtAbs <= 0){
     throw new Error("当前无浮盈，跳过止损设置");
   }
-  const rule = (await getRules())[sym] || {};
+  const rule = (await getRule(sym)) || {};
   const prec = rule.pricePrec || 2;
   const side = pos.amt > 0 ? "SELL" : "BUY";
   // 持仓模式：双向(对冲)挂平仓单不允许传 reduceOnly（-1106）、positionSide 用 LONG/SHORT；
@@ -1175,7 +1192,7 @@ async function addPos(sym, acctIdx, setSL, dir){
     const accounts = loadKeys().filter(a => a && a.api_key && a.api_secret);
     const acct = accounts[acctIdx];
     if (!acct) throw new Error("账户不存在");
-    const rule = (await getRules())[sym];
+    const rule = await getRule(sym);
     if (!rule || !rule.minNotional) throw new Error("未获取到最小加仓额");
     // 按方向取当前仓位记录（双向持仓下同币有多空两行，不能只 find 第一条）
     const cur = allRows.find(r => r.symbol === sym && r.acctIdx === acctIdx && (dir === "long" ? r.amt > 0 : r.amt < 0));
@@ -1278,7 +1295,7 @@ async function doAddPosV2(sym, acctIdx, dir){
 
     // 2. 计算数量：当前持仓数量的 38%；算出数量太小（低于系统最小开仓要求）
     //    时改用最小加仓数量，保证能正常下单
-    const rule = (await getRules())[sym] || {};
+    const rule = (await getRule(sym)) || {};
     let qty = Math.abs(pre.amt) * 0.38;
     let useMinFallback = false;
     if(rule.step>0){
@@ -1366,7 +1383,7 @@ async function resumePendingSL(){
     try{
       const sl = await applyStopLoss(acct, t.sym, t.dir);
       clearPending(t.acctIdx, t.sym, t.dir);
-      addLog("["+esc(name)+"] "+t.sym+" 止损已补设 @"+sl.stopPrice.toFixed((await getRules())[t.sym]?.pricePrec||2), "log-ok");
+      addLog("["+esc(name)+"] "+t.sym+" 止损已补设 @"+sl.stopPrice.toFixed((await getRule(t.sym))?.pricePrec||2), "log-ok");
     }catch(e){
       if(/无需|已平仓|不存在/i.test(e.message)){
         clearPending(t.acctIdx, t.sym, t.dir);
